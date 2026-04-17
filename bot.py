@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import sqlite3
 from pathlib import Path
 
@@ -14,7 +15,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN fehlt in der .env Datei.")
+    raise RuntimeError("DISCORD_TOKEN fehlt in der .env Datei oder in Railway Variables.")
 
 if not GUILD_ID_RAW.isdigit():
     raise RuntimeError("GUILD_ID fehlt in der .env Datei oder ist ungültig.")
@@ -120,13 +121,7 @@ def get_profile(user_id: int):
     }
 
 
-def save_profile(
-    user_id: int,
-    base_name=None,
-    jersey=None,
-    main_positions=None,
-    side_positions=None,
-):
+def save_profile(user_id: int, base_name=None, jersey=None, main_positions=None, side_positions=None):
     current = get_profile(user_id)
 
     if base_name is None:
@@ -164,7 +159,6 @@ def save_profile(
 def strip_managed_nick(name: str) -> str:
     if not name:
         return "Spieler"
-
     pattern = r"^(?:#\d{1,2}\s*\|\s*)?(?:[A-Z/]{2,20}\s*\|\s*)?"
     stripped = re.sub(pattern, "", name).strip()
     return stripped if stripped else name
@@ -232,7 +226,7 @@ async def ensure_base_name(member: discord.Member):
     return base_name
 
 
-def meets_registered_requirements(profile: dict) -> bool:
+def meets_profile_requirements(profile: dict) -> bool:
     return (
         bool(profile["jersey"])
         and 1 <= len(profile["main_positions"]) <= 2
@@ -265,14 +259,14 @@ async def update_registered_role(member: discord.Member):
         return
 
     profile = get_profile(member.id)
-    should_have = meets_registered_requirements(profile)
+    should_have = meets_profile_requirements(profile)
     has_registered = registered_role in member.roles
 
     try:
         if should_have and not has_registered:
-            await member.add_roles(registered_role, reason="Registrierungs-Voraussetzungen erfüllt")
+            await member.add_roles(registered_role, reason="Profil vollständig")
         elif not should_have and has_registered:
-            await member.remove_roles(registered_role, reason="Registrierungs-Voraussetzungen nicht mehr erfüllt")
+            await member.remove_roles(registered_role, reason="Profil unvollständig")
     except discord.Forbidden:
         pass
     except discord.HTTPException:
@@ -284,14 +278,15 @@ async def update_finished_role(member: discord.Member):
     if finished_role is None:
         return
 
-    should_have = has_role(member, ROLE_TESTER) and has_role(member, ROLE_REGISTERED)
+    profile = get_profile(member.id)
+    should_have = has_role(member, ROLE_TESTER) and meets_profile_requirements(profile)
     has_finished = finished_role in member.roles
 
     try:
         if should_have and not has_finished:
-            await member.add_roles(finished_role, reason="Tester und Registriert vorhanden")
+            await member.add_roles(finished_role, reason="Tester und Profil vollständig")
         elif not should_have and has_finished:
-            await member.remove_roles(finished_role, reason="Tester und/oder Registriert fehlt")
+            await member.remove_roles(finished_role, reason="Tester oder Profil unvollständig")
     except discord.Forbidden:
         pass
     except discord.HTTPException:
@@ -319,11 +314,7 @@ async def update_member_profile(member: discord.Member):
         pass
 
 
-async def create_role_if_missing(
-    guild: discord.Guild,
-    name: str,
-    colour: discord.Colour = discord.Colour.default(),
-):
+async def create_role_if_missing(guild: discord.Guild, name: str, colour: discord.Colour = discord.Colour.default()):
     role = get_role_by_name(guild, name)
     if role is None:
         role = await guild.create_role(name=name, colour=colour, reason="Vollpfosten CR8 Setup")
@@ -337,12 +328,7 @@ async def create_category_if_missing(guild: discord.Guild, name: str):
     return category
 
 
-async def create_text_if_missing(
-    guild: discord.Guild,
-    category: discord.CategoryChannel,
-    name: str,
-    overwrites=None,
-):
+async def create_text_if_missing(guild: discord.Guild, category: discord.CategoryChannel, name: str, overwrites=None):
     channel = discord.utils.get(guild.text_channels, name=name)
     if channel is None:
         channel = await guild.create_text_channel(
@@ -354,13 +340,7 @@ async def create_text_if_missing(
     return channel
 
 
-async def create_voice_if_missing(
-    guild: discord.Guild,
-    category: discord.CategoryChannel,
-    name: str,
-    overwrites=None,
-    user_limit=None,
-):
+async def create_voice_if_missing(guild: discord.Guild, category: discord.CategoryChannel, name: str, overwrites=None, user_limit=None):
     channel = discord.utils.get(guild.voice_channels, name=name)
     if channel is None:
         channel = await guild.create_voice_channel(
@@ -373,51 +353,20 @@ async def create_voice_if_missing(
     return channel
 
 
-def overwrite_visible_readonly(guild, roles_allowed):
-    ow = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=False,
-            send_messages=False,
-            read_message_history=False,
-        )
-    }
-
-    for role in roles_allowed:
-        ow[role] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=False,
-            read_message_history=True,
-        )
-
-    if guild.me is not None:
-        ow[guild.me] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-        )
-
-    return ow
-
-
 def overwrite_hidden_except(guild, roles_allowed, can_send=True):
-    ow = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False)
-    }
-
+    ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
     for role in roles_allowed:
         ow[role] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=can_send,
             read_message_history=True,
         )
-
     if guild.me is not None:
         ow[guild.me] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
             read_message_history=True,
         )
-
     return ow
 
 
@@ -493,11 +442,7 @@ async def set_profile_channels_mode(guild: discord.Guild, offline_mode: bool):
     channel_names = [CH_MAIN_POSITIONS, CH_SIDE_POSITIONS, CH_NUMBERS]
     text_channels = {c.name: c for c in guild.text_channels}
 
-    overwrites = (
-        build_profile_channel_overwrites_off(guild)
-        if offline_mode
-        else build_profile_channel_overwrites_normal(guild)
-    )
+    overwrites = build_profile_channel_overwrites_off(guild) if offline_mode else build_profile_channel_overwrites_normal(guild)
 
     for name in channel_names:
         channel = text_channels.get(name)
@@ -520,13 +465,7 @@ async def delete_panel_messages(channel: discord.TextChannel, marker: str, bot_u
             pass
 
 
-async def replace_panel_message(
-    channel: discord.TextChannel,
-    marker: str,
-    content: str,
-    view: discord.ui.View,
-    bot_user,
-):
+async def replace_panel_message(channel: discord.TextChannel, marker: str, content: str, view: discord.ui.View, bot_user):
     await delete_panel_messages(channel, marker, bot_user)
     await channel.send(f"{marker}\n{content}", view=view)
 
@@ -545,17 +484,12 @@ class MainPositionSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_use_profile_system(interaction.user):
-            await interaction.response.send_message(
-                "Du brauchst dafür die Rolle **Tester**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
 
         selected = list(self.values)
         profile = get_profile(interaction.user.id)
-
         save_profile(
             interaction.user.id,
             base_name=profile["base_name"],
@@ -565,10 +499,7 @@ class MainPositionSelect(discord.ui.Select):
         )
 
         await update_member_profile(interaction.user)
-        await interaction.response.send_message(
-            f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**", ephemeral=True)
 
 
 class MainPositionView(discord.ui.View):
@@ -580,7 +511,6 @@ class MainPositionView(discord.ui.View):
     async def reset_main_positions(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_use_profile_system(interaction.user):
             await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
@@ -614,17 +544,12 @@ class SidePositionSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_use_profile_system(interaction.user):
-            await interaction.response.send_message(
-                "Du brauchst dafür die Rolle **Tester**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
 
         selected = list(self.values)
         profile = get_profile(interaction.user.id)
-
         save_profile(
             interaction.user.id,
             base_name=profile["base_name"],
@@ -635,10 +560,7 @@ class SidePositionSelect(discord.ui.Select):
 
         await update_member_profile(interaction.user)
         text = ", ".join(selected) if selected else "keine"
-        await interaction.response.send_message(
-            f"Deine Nebenpositionen wurden gesetzt: **{text}**",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"Deine Nebenpositionen wurden gesetzt: **{text}**", ephemeral=True)
 
 
 class SidePositionView(discord.ui.View):
@@ -650,7 +572,6 @@ class SidePositionView(discord.ui.View):
     async def reset_side_positions(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_use_profile_system(interaction.user):
             await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
@@ -681,12 +602,8 @@ class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
     async def on_submit(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_use_profile_system(interaction.user):
-            await interaction.response.send_message(
-                "Du brauchst dafür die Rolle **Tester**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
 
         raw = self.trikotnummer.value.strip()
@@ -710,10 +627,7 @@ class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
         )
 
         await update_member_profile(interaction.user)
-        await interaction.response.send_message(
-            f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.", ephemeral=True)
 
 
 class NumberView(discord.ui.View):
@@ -791,7 +705,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def setup_server(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
         return
-
     if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
         await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
         return
@@ -814,86 +727,50 @@ async def setup_server(interaction: discord.Interaction):
     voice_cat = await create_category_if_missing(guild, CATEGORY_VOICE)
 
     main_positions_channel = await create_text_if_missing(
-        guild,
-        info_cat,
-        CH_MAIN_POSITIONS,
-        overwrites=build_profile_channel_overwrites_normal(guild),
+        guild, info_cat, CH_MAIN_POSITIONS, overwrites=build_profile_channel_overwrites_normal(guild)
     )
-
     side_positions_channel = await create_text_if_missing(
-        guild,
-        info_cat,
-        CH_SIDE_POSITIONS,
-        overwrites=build_profile_channel_overwrites_normal(guild),
+        guild, info_cat, CH_SIDE_POSITIONS, overwrites=build_profile_channel_overwrites_normal(guild)
     )
-
     numbers_channel = await create_text_if_missing(
-        guild,
-        info_cat,
-        CH_NUMBERS,
-        overwrites=build_profile_channel_overwrites_normal(guild),
+        guild, info_cat, CH_NUMBERS, overwrites=build_profile_channel_overwrites_normal(guild)
     )
 
     await create_text_if_missing(
-        guild,
-        chat_cat,
-        CH_GENERAL,
+        guild, chat_cat, CH_GENERAL,
         overwrites=overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role),
     )
-
     await create_text_if_missing(
-        guild,
-        chat_cat,
-        CH_CLIPS,
+        guild, chat_cat, CH_CLIPS,
         overwrites=overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role),
     )
-
     await create_text_if_missing(
-        guild,
-        chat_cat,
-        CH_LINEUPS,
+        guild, chat_cat, CH_LINEUPS,
         overwrites=overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role),
     )
-
     await create_text_if_missing(
-        guild,
-        chat_cat,
-        CH_AVAILABILITY,
+        guild, chat_cat, CH_AVAILABILITY,
         overwrites=overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role),
     )
-
     await create_text_if_missing(
-        guild,
-        team_cat,
-        CH_MANAGER,
+        guild, team_cat, CH_MANAGER,
         overwrites=overwrite_hidden_except(guild, [manager_role], can_send=True),
     )
-
     await create_text_if_missing(
-        guild,
-        team_cat,
-        CH_STAMMELF,
+        guild, team_cat, CH_STAMMELF,
         overwrites=overwrite_hidden_except(guild, [stammelf_role, manager_role], can_send=True),
     )
 
     await create_voice_if_missing(
-        guild,
-        voice_cat,
-        VC_BENCH,
+        guild, voice_cat, VC_BENCH,
         overwrites=overwrite_voice_public(guild, tester_role, manager_role, stammelf_role),
     )
-
     await create_voice_if_missing(
-        guild,
-        voice_cat,
-        VC_STAMMELF,
+        guild, voice_cat, VC_STAMMELF,
         overwrites=overwrite_voice_stammelf(guild, tester_role, manager_role, stammelf_role),
     )
-
     await create_voice_if_missing(
-        guild,
-        voice_cat,
-        VC_MANAGER,
+        guild, voice_cat, VC_MANAGER,
         overwrites=overwrite_voice_manager(guild, manager_role),
     )
 
@@ -918,25 +795,13 @@ async def setup_server(interaction: discord.Interaction):
     )
 
     await replace_panel_message(
-        main_positions_channel,
-        MAIN_POSITIONS_MARKER,
-        main_positions_text,
-        MainPositionView(),
-        interaction.client.user,
+        main_positions_channel, MAIN_POSITIONS_MARKER, main_positions_text, MainPositionView(), interaction.client.user
     )
     await replace_panel_message(
-        side_positions_channel,
-        SIDE_POSITIONS_MARKER,
-        side_positions_text,
-        SidePositionView(),
-        interaction.client.user,
+        side_positions_channel, SIDE_POSITIONS_MARKER, side_positions_text, SidePositionView(), interaction.client.user
     )
     await replace_panel_message(
-        numbers_channel,
-        NUMBERS_MARKER,
-        numbers_text,
-        NumberView(),
-        interaction.client.user,
+        numbers_channel, NUMBERS_MARKER, numbers_text, NumberView(), interaction.client.user
     )
 
     await interaction.followup.send("Serverstruktur und die 3 Profil-Panels wurden aktualisiert.", ephemeral=True)
@@ -946,7 +811,6 @@ async def setup_server(interaction: discord.Interaction):
 async def nickname_refresh(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
         return
-
     await update_member_profile(interaction.user)
     await interaction.response.send_message("Dein Nickname wurde aktualisiert.", ephemeral=True)
 
@@ -955,32 +819,39 @@ async def nickname_refresh(interaction: discord.Interaction):
 async def turn_off_bot(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
         return
-
     if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
         await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
         return
 
     await set_profile_channels_mode(interaction.guild, offline_mode=True)
-    await interaction.response.send_message(
-        "Profilkanäle sind jetzt für **alle** ausgeblendet.",
-        ephemeral=True,
-    )
+    await interaction.response.send_message("Profilkanäle sind jetzt für **alle** ausgeblendet.", ephemeral=True)
 
 
 @bot.tree.command(name="turn_on_bot", description="Macht Profilkanäle für alle sichtbar")
 async def turn_on_bot(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
         return
-
     if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
         await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
         return
 
     await set_profile_channels_mode(interaction.guild, offline_mode=False)
-    await interaction.response.send_message(
-        "Profilkanäle sind jetzt für **alle** sichtbar.",
-        ephemeral=True,
-    )
+    await interaction.response.send_message("Profilkanäle sind jetzt für **alle** sichtbar.", ephemeral=True)
 
 
-bot.run(TOKEN)
+def main():
+    while True:
+        try:
+            bot.run(TOKEN)
+            break
+        except KeyboardInterrupt:
+            print("Bot manuell gestoppt.")
+            break
+        except Exception as e:
+            print(f"Bot abgestürzt: {e}")
+            print("Neustart in 10 Sekunden...")
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
