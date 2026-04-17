@@ -7,6 +7,7 @@ from pathlib import Path
 
 import discord
 from discord.ext import commands
+from discord import app_commands
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,12 +33,16 @@ ROLE_REGISTERED = "Registriert"
 ROLE_FINISHED = "Fertig"
 
 POSITIONS = ["TW", "IV", "RV", "LV", "ZDM", "ZM", "ZOM", "LF", "RF", "ST"]
+OFF_POSITIONS = {"LF", "ZOM", "RF", "ST"}
+MID_POSITIONS = {"ZM", "ZDM"}
+DEF_POSITIONS = {"IV", "RV", "LV", "TW"}
 
 CATEGORY_INFO = "📌 INFO"
 CATEGORY_CHAT = "💬 CHAT"
 CATEGORY_TEAM = "🧠 TEAM"
 CATEGORY_VOICE = "🔊 VOICE"
 
+CH_RULES = "regeln"
 CH_MAIN_POSITIONS = "hauptpositionen"
 CH_SIDE_POSITIONS = "nebenpositionen"
 CH_NUMBERS = "trikotnummer"
@@ -52,9 +57,50 @@ VC_BENCH = "bank"
 VC_STAMMELF = "kabine"
 VC_MANAGER = "krisenbesprechung"
 
+RULES_MARKER = "[VCR8_RULES_PANEL]"
 MAIN_POSITIONS_MARKER = "[VCR8_MAIN_POSITIONS_PANEL]"
 SIDE_POSITIONS_MARKER = "[VCR8_SIDE_POSITIONS_PANEL]"
 NUMBERS_MARKER = "[VCR8_NUMBERS_PANEL]"
+
+RULES_TEXT = """📜 **Regeln für Vollpfosten CR8**
+
+Willkommen im Vereinsserver!  
+Mit dem Akzeptieren der Regeln verpflichtest du dich, dich an folgende Punkte zu halten:
+
+**Respekt & Umgang**
+- Behandle alle Mitglieder respektvoll
+- Kein Beleidigen, Provozieren oder unnötiges Drama
+
+**Verhalten im Spiel**
+- Kein unnötiges Geflame oder Rage
+- Bei wichtigen Spielen wird konzentriert gespielt
+- Spaß ist erlaubt, aber nicht auf Kosten des Teams
+
+**Teamplay**
+- Teamplay steht immer über Ego-Play
+- Halte deine Position und spiel fürs Team
+- Kommunikation ist wichtig
+
+**Organisation**
+- Höre auf Ansagen von Managern und Stammelf
+- Reagiere auf Verfügbarkeitsabfragen ehrlich
+- Sei pünktlich zu Spielen und Training
+
+**Aktivität & Zuverlässigkeit**
+- Wer dauerhaft unzuverlässig ist, muss mit Konsequenzen rechnen
+- Abmelden ist Pflicht, wenn du nicht kannst
+
+**Discord Verhalten**
+- Kein Spam in Channels oder Voice
+- Nutze die richtigen Channels (z. B. Clips nur in #clips)
+- Halte den Server übersichtlich
+
+**Allgemein**
+- Jeder vertritt mit seinem Verhalten den Verein
+- Entscheidungen der Manager sind zu respektieren
+
+Drücke unten auf den Button, um die Regeln zu akzeptieren und die Rolle **Tester** zu erhalten.
+"""
 
 
 def db():
@@ -259,14 +305,14 @@ async def update_registered_role(member: discord.Member):
         return
 
     profile = get_profile(member.id)
-    should_have = meets_profile_requirements(profile)
+    should_have = has_role(member, ROLE_TESTER) and meets_profile_requirements(profile)
     has_registered = registered_role in member.roles
 
     try:
         if should_have and not has_registered:
-            await member.add_roles(registered_role, reason="Profil vollständig")
+            await member.add_roles(registered_role, reason="Tester und Profil vollständig")
         elif not should_have and has_registered:
-            await member.remove_roles(registered_role, reason="Profil unvollständig")
+            await member.remove_roles(registered_role, reason="Tester oder Profil unvollständig")
     except discord.Forbidden:
         pass
     except discord.HTTPException:
@@ -438,10 +484,33 @@ def build_profile_channel_overwrites_off(guild: discord.Guild):
     }
 
 
+def build_availability_overwrites(guild: discord.Guild):
+    fertig_role = get_role_by_name(guild, ROLE_FINISHED)
+    return {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False,
+            send_messages=False,
+            read_message_history=False,
+            add_reactions=False,
+        ),
+        fertig_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            read_message_history=True,
+            add_reactions=False,
+        ) if fertig_role else discord.PermissionOverwrite(),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            add_reactions=False,
+        ),
+    }
+
+
 async def set_profile_channels_mode(guild: discord.Guild, offline_mode: bool):
     channel_names = [CH_MAIN_POSITIONS, CH_SIDE_POSITIONS, CH_NUMBERS]
     text_channels = {c.name: c for c in guild.text_channels}
-
     overwrites = build_profile_channel_overwrites_off(guild) if offline_mode else build_profile_channel_overwrites_normal(guild)
 
     for name in channel_names:
@@ -468,6 +537,37 @@ async def delete_panel_messages(channel: discord.TextChannel, marker: str, bot_u
 async def replace_panel_message(channel: discord.TextChannel, marker: str, content: str, view: discord.ui.View, bot_user):
     await delete_panel_messages(channel, marker, bot_user)
     await channel.send(f"{marker}\n{content}", view=view)
+
+
+class RulesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Regeln akzeptieren", style=discord.ButtonStyle.success, custom_id="vcr8:rules:accept")
+    async def accept_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        tester_role = get_role_by_name(interaction.guild, ROLE_TESTER)
+        if tester_role is None:
+            await interaction.response.send_message("Die Rolle **Tester** existiert nicht.", ephemeral=True)
+            return
+
+        if tester_role in interaction.user.roles:
+            await interaction.response.send_message("Du hast die Regeln bereits akzeptiert.", ephemeral=True)
+            return
+
+        try:
+            await interaction.user.add_roles(tester_role, reason="Regeln akzeptiert")
+        except discord.Forbidden:
+            await interaction.response.send_message("Ich darf die Rolle **Tester** nicht vergeben.", ephemeral=True)
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message("Fehler beim Vergeben der Rolle **Tester**.", ephemeral=True)
+            return
+
+        await update_member_profile(interaction.user)
+        await interaction.response.send_message("Regeln akzeptiert. Du hast jetzt die Rolle **Tester**.", ephemeral=True)
 
 
 class MainPositionSelect(discord.ui.Select):
@@ -607,7 +707,6 @@ class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
             return
 
         raw = self.trikotnummer.value.strip()
-
         if not raw.isdigit():
             await interaction.response.send_message("Bitte nur Zahlen eingeben.", ephemeral=True)
             return
@@ -642,6 +741,92 @@ class NumberView(discord.ui.View):
             pass
 
 
+class AvailabilityView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.yes_ids: set[int] = set()
+        self.no_ids: set[int] = set()
+
+    def get_bucket(self, member: discord.Member) -> str:
+        role_names = {r.name for r in member.roles}
+
+        if role_names & OFF_POSITIONS:
+            return "off"
+        if role_names & MID_POSITIONS:
+            return "mid"
+        if role_names & DEF_POSITIONS:
+            return "def"
+        return "def"
+
+    async def rebuild_embed(self, interaction: discord.Interaction):
+        offensive = []
+        midfield = []
+        defensive = []
+        no_list = []
+
+        guild = interaction.guild
+        if guild is None or not interaction.message:
+            return
+
+        for user_id in self.yes_ids:
+            member = guild.get_member(user_id)
+            if member is None:
+                continue
+
+            bucket = self.get_bucket(member)
+            if bucket == "off":
+                offensive.append(member.display_name)
+            elif bucket == "mid":
+                midfield.append(member.display_name)
+            else:
+                defensive.append(member.display_name)
+
+        for user_id in self.no_ids:
+            member = guild.get_member(user_id)
+            if member is None:
+                continue
+            no_list.append(member.display_name)
+
+        embed = interaction.message.embeds[0]
+        embed.clear_fields()
+        embed.add_field(name="🔥 Offensive", value="\n".join(offensive) if offensive else "-", inline=True)
+        embed.add_field(name="⚙️ Mittelfeld", value="\n".join(midfield) if midfield else "-", inline=True)
+        embed.add_field(name="🛡️ Defensive", value="\n".join(defensive) if defensive else "-", inline=True)
+        embed.add_field(name="❌ Nein", value="\n".join(no_list) if no_list else "-", inline=False)
+
+        await interaction.message.edit(embed=embed, view=self)
+
+    @discord.ui.button(label="✅ Ja", style=discord.ButtonStyle.success, custom_id="vcr8:availability:yes")
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            return
+        if not has_role(interaction.user, ROLE_FINISHED):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+            return
+
+        self.no_ids.discard(interaction.user.id)
+        self.yes_ids.add(interaction.user.id)
+
+        await interaction.response.defer(ephemeral=True)
+        await self.rebuild_embed(interaction)
+        await interaction.followup.send("Du wurdest als **Ja** eingetragen.", ephemeral=True)
+
+    @discord.ui.button(label="❌ Nein", style=discord.ButtonStyle.danger, custom_id="vcr8:availability:no")
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            return
+        if not has_role(interaction.user, ROLE_FINISHED):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+            return
+
+        self.yes_ids.discard(interaction.user.id)
+        self.no_ids.add(interaction.user.id)
+
+        await interaction.response.defer(ephemeral=True)
+        await self.rebuild_embed(interaction)
+        await interaction.followup.send("Du wurdest als **Nein** eingetragen.", ephemeral=True)
+
+
 intents = discord.Intents.default()
 intents.members = True
 
@@ -654,6 +839,7 @@ class VollpfostenBot(commands.Bot):
         init_db()
         migrate_db()
 
+        self.add_view(RulesView())
         self.add_view(MainPositionView())
         self.add_view(SidePositionView())
         self.add_view(NumberView())
@@ -675,7 +861,6 @@ async def on_ready():
     print(f"Eingeloggt als {bot.user} ({bot.user.id})")
     for g in bot.guilds:
         print(f"Server: {g.name} | ID: {g.id}")
-
     try:
         await bot.user.edit(username=SERVER_NAME[:32])
     except Exception:
@@ -701,6 +886,51 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         await update_member_profile(after)
 
 
+@app_commands.describe(
+    titel="Name der Abstimmung",
+    datum="Wochentag oder Datum, z. B. Sonntag 20.04.",
+    uhrzeit="Uhrzeit, z. B. 20:30",
+    details="Zweck oder Beschreibung der Abstimmung"
+)
+@bot.tree.command(name="verfuegbarkeit", description="Erstellt eine Verfügbarkeitsabfrage")
+async def verfuegbarkeit(
+    interaction: discord.Interaction,
+    titel: str,
+    datum: str,
+    uhrzeit: str,
+    details: str,
+):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user):
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    channel = discord.utils.get(guild.text_channels, name=CH_AVAILABILITY)
+    if channel is None:
+        await interaction.response.send_message("Der Kanal **verfuegbarkeit** existiert nicht.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=titel,
+        description=f"📅 **Datum:** {datum}\n⏰ **Uhrzeit:** {uhrzeit}\n\n📝 **Zweck:**\n{details}",
+        colour=discord.Colour.green(),
+    )
+    embed.add_field(name="🔥 Offensive", value="-", inline=True)
+    embed.add_field(name="⚙️ Mittelfeld", value="-", inline=True)
+    embed.add_field(name="🛡️ Defensive", value="-", inline=True)
+    embed.add_field(name="❌ Nein", value="-", inline=False)
+    embed.set_footer(text=f"Erstellt von {interaction.user.display_name}")
+
+    view = AvailabilityView()
+    await channel.send(embed=embed, view=view)
+    await interaction.response.send_message("Verfügbarkeitsabfrage wurde erstellt.", ephemeral=True)
+
+
 @bot.tree.command(name="setup_server", description="Erstellt Rollen, Kanäle und Panels für Vollpfosten CR8")
 async def setup_server(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
@@ -710,6 +940,9 @@ async def setup_server(interaction: discord.Interaction):
         return
 
     guild = interaction.guild
+    if guild is None:
+        return
+
     await interaction.response.send_message("Setup läuft ...", ephemeral=True)
 
     manager_role = await create_role_if_missing(guild, ROLE_MANAGER, discord.Colour.red())
@@ -726,14 +959,45 @@ async def setup_server(interaction: discord.Interaction):
     team_cat = await create_category_if_missing(guild, CATEGORY_TEAM)
     voice_cat = await create_category_if_missing(guild, CATEGORY_VOICE)
 
+    rules_channel = await create_text_if_missing(
+        guild,
+        info_cat,
+        CH_RULES,
+        overwrites=build_profile_channel_overwrites_normal(guild),
+    )
     main_positions_channel = await create_text_if_missing(
-        guild, info_cat, CH_MAIN_POSITIONS, overwrites=build_profile_channel_overwrites_normal(guild)
+        guild,
+        info_cat,
+        CH_MAIN_POSITIONS,
+        overwrites=build_profile_channel_overwrites_normal(guild),
     )
     side_positions_channel = await create_text_if_missing(
-        guild, info_cat, CH_SIDE_POSITIONS, overwrites=build_profile_channel_overwrites_normal(guild)
+        guild,
+        info_cat,
+        CH_SIDE_POSITIONS,
+        overwrites=build_profile_channel_overwrites_normal(guild),
     )
     numbers_channel = await create_text_if_missing(
-        guild, info_cat, CH_NUMBERS, overwrites=build_profile_channel_overwrites_normal(guild)
+        guild,
+        info_cat,
+        CH_NUMBERS,
+        overwrites=build_profile_channel_overwrites_normal(guild),
+    )
+
+    old_availability = discord.utils.get(guild.text_channels, name=CH_AVAILABILITY)
+    if old_availability is not None:
+        try:
+            await old_availability.delete(reason="Vollpfosten CR8 Setup: Verfügbarkeitskanal neu erstellen")
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+    availability_channel = await guild.create_text_channel(
+        name=CH_AVAILABILITY,
+        category=chat_cat,
+        overwrites=build_availability_overwrites(guild),
+        reason="Vollpfosten CR8 Setup",
     )
 
     await create_text_if_missing(
@@ -746,10 +1010,6 @@ async def setup_server(interaction: discord.Interaction):
     )
     await create_text_if_missing(
         guild, chat_cat, CH_LINEUPS,
-        overwrites=overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role),
-    )
-    await create_text_if_missing(
-        guild, chat_cat, CH_AVAILABILITY,
         overwrites=overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role),
     )
     await create_text_if_missing(
@@ -794,17 +1054,15 @@ async def setup_server(interaction: discord.Interaction):
         "Die Nummer wird zusammen mit deinen Hauptpositionen in deinen Nicknamen übernommen."
     )
 
-    await replace_panel_message(
-        main_positions_channel, MAIN_POSITIONS_MARKER, main_positions_text, MainPositionView(), interaction.client.user
-    )
-    await replace_panel_message(
-        side_positions_channel, SIDE_POSITIONS_MARKER, side_positions_text, SidePositionView(), interaction.client.user
-    )
-    await replace_panel_message(
-        numbers_channel, NUMBERS_MARKER, numbers_text, NumberView(), interaction.client.user
-    )
+    await replace_panel_message(rules_channel, RULES_MARKER, RULES_TEXT, RulesView(), interaction.client.user)
+    await replace_panel_message(main_positions_channel, MAIN_POSITIONS_MARKER, main_positions_text, MainPositionView(), interaction.client.user)
+    await replace_panel_message(side_positions_channel, SIDE_POSITIONS_MARKER, side_positions_text, SidePositionView(), interaction.client.user)
+    await replace_panel_message(numbers_channel, NUMBERS_MARKER, numbers_text, NumberView(), interaction.client.user)
 
-    await interaction.followup.send("Serverstruktur und die 3 Profil-Panels wurden aktualisiert.", ephemeral=True)
+    await interaction.followup.send(
+        f"Setup fertig. Der Kanal **{availability_channel.mention}** wurde neu erstellt und die Panels wurden aktualisiert.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="nickname_refresh", description="Aktualisiert deinen Nickname")
