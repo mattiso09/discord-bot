@@ -33,6 +33,7 @@ ROLE_REGISTERED = "Registriert"
 ROLE_FINISHED = "Fertig"
 
 POSITIONS = ["TW", "IV", "RV", "LV", "ZDM", "ZM", "ZOM", "LF", "RF", "ST"]
+
 OFF_POSITIONS = {"LF", "ZOM", "RF", "ST"}
 MID_POSITIONS = {"ZM", "ZDM"}
 DEF_POSITIONS = {"IV", "RV", "LV", "TW"}
@@ -64,7 +65,7 @@ NUMBERS_MARKER = "[VCR8_NUMBERS_PANEL]"
 
 RULES_TEXT = """📜 **Regeln für Vollpfosten CR8**
 
-Willkommen im Vereinsserver!  
+Willkommen im Vereinsserver!
 Mit dem Akzeptieren der Regeln verpflichtest du dich, dich an folgende Punkte zu halten:
 
 **Respekt & Umgang**
@@ -101,6 +102,14 @@ Mit dem Akzeptieren der Regeln verpflichtest du dich, dich an folgende Punkte zu
 
 Drücke unten auf den Button, um die Regeln zu akzeptieren und die Rolle **Tester** zu erhalten.
 """
+
+
+def main_role_name(pos: str) -> str:
+    return f"Haupt-{pos}"
+
+
+def side_role_name(pos: str) -> str:
+    return f"Neben-{pos}"
 
 
 def db():
@@ -205,9 +214,28 @@ def save_profile(user_id: int, base_name=None, jersey=None, main_positions=None,
 def strip_managed_nick(name: str) -> str:
     if not name:
         return "Spieler"
-    pattern = r"^(?:#\d{1,2}\s*\|\s*)?(?:[A-Z/]{2,20}\s*\|\s*)?"
+    pattern = r"^(?:#\d{1,2}\s*\|\s*)?(?:[A-Z/]{2,20}(?:/[A-Z/]{2,20})?\s*\|\s*)?"
     stripped = re.sub(pattern, "", name).strip()
     return stripped if stripped else name
+
+
+def strip_number_from_nick(name: str) -> str:
+    if not name:
+        return "Spieler"
+    stripped = re.sub(r"^#\d{1,2}\s*\|\s*", "", name).strip()
+    return stripped if stripped else name
+
+
+def clean_name_for_availability(member: discord.Member) -> str:
+    profile = get_profile(member.id)
+    base_name = profile["base_name"]
+    if base_name:
+        return base_name
+
+    raw = member.nick or member.global_name or member.name
+    raw = strip_number_from_nick(raw)
+    raw = strip_managed_nick(raw)
+    return raw
 
 
 def is_manager(member: discord.Member) -> bool:
@@ -281,15 +309,36 @@ def meets_profile_requirements(profile: dict) -> bool:
 
 
 async def sync_position_roles(member: discord.Member):
+    guild = member.guild
     profile = get_profile(member.id)
-    wanted = set(profile["main_positions"] + profile["side_positions"])
 
-    current_pos_roles = [r for r in member.roles if r.name in POSITIONS]
-    remove_roles = [r for r in current_pos_roles if r.name not in wanted]
+    wanted_main = set(profile["main_positions"])
+    wanted_side = set(profile["side_positions"])
+
+    current_managed_roles = []
+    for role in member.roles:
+        if role.name.startswith("Haupt-") or role.name.startswith("Neben-"):
+            current_managed_roles.append(role)
+
+    remove_roles = []
+    for role in current_managed_roles:
+        if role.name.startswith("Haupt-"):
+            pos = role.name.replace("Haupt-", "", 1)
+            if pos not in wanted_main:
+                remove_roles.append(role)
+        elif role.name.startswith("Neben-"):
+            pos = role.name.replace("Neben-", "", 1)
+            if pos not in wanted_side:
+                remove_roles.append(role)
 
     add_roles = []
-    for pos in wanted:
-        role = get_role_by_name(member.guild, pos)
+    for pos in wanted_main:
+        role = get_role_by_name(guild, main_role_name(pos))
+        if role and role not in member.roles:
+            add_roles.append(role)
+
+    for pos in wanted_side:
+        role = get_role_by_name(guild, side_role_name(pos))
         if role and role not in member.roles:
             add_roles.append(role)
 
@@ -590,6 +639,7 @@ class MainPositionSelect(discord.ui.Select):
 
         selected = list(self.values)
         profile = get_profile(interaction.user.id)
+
         save_profile(
             interaction.user.id,
             base_name=profile["base_name"],
@@ -650,6 +700,7 @@ class SidePositionSelect(discord.ui.Select):
 
         selected = list(self.values)
         profile = get_profile(interaction.user.id)
+
         save_profile(
             interaction.user.id,
             base_name=profile["base_name"],
@@ -717,6 +768,7 @@ class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
             return
 
         profile = get_profile(interaction.user.id)
+
         save_profile(
             interaction.user.id,
             base_name=profile["base_name"],
@@ -747,14 +799,25 @@ class AvailabilityView(discord.ui.View):
         self.yes_ids: set[int] = set()
         self.no_ids: set[int] = set()
 
-    def get_bucket(self, member: discord.Member) -> str:
-        role_names = {r.name for r in member.roles}
+    def first_main_position(self, member: discord.Member) -> str:
+        profile = get_profile(member.id)
+        if profile["main_positions"]:
+            return profile["main_positions"][0]
+        return "?"
 
-        if role_names & OFF_POSITIONS:
+    def display_label(self, member: discord.Member) -> str:
+        pos = self.first_main_position(member)
+        name = clean_name_for_availability(member)
+        return f"{pos} | {name}"
+
+    def get_bucket(self, member: discord.Member) -> str:
+        pos = self.first_main_position(member)
+
+        if pos in OFF_POSITIONS:
             return "off"
-        if role_names & MID_POSITIONS:
+        if pos in MID_POSITIONS:
             return "mid"
-        if role_names & DEF_POSITIONS:
+        if pos in DEF_POSITIONS:
             return "def"
         return "def"
 
@@ -768,28 +831,40 @@ class AvailabilityView(discord.ui.View):
         if guild is None or not interaction.message:
             return
 
+        yes_members = []
         for user_id in self.yes_ids:
             member = guild.get_member(user_id)
-            if member is None:
-                continue
+            if member is not None:
+                yes_members.append(member)
 
-            bucket = self.get_bucket(member)
-            if bucket == "off":
-                offensive.append(member.display_name)
-            elif bucket == "mid":
-                midfield.append(member.display_name)
-            else:
-                defensive.append(member.display_name)
-
+        no_members = []
         for user_id in self.no_ids:
             member = guild.get_member(user_id)
-            if member is None:
-                continue
-            no_list.append(member.display_name)
+            if member is not None:
+                no_members.append(member)
+
+        for member in yes_members:
+            label = self.display_label(member)
+            bucket = self.get_bucket(member)
+
+            if bucket == "off":
+                offensive.append(label)
+            elif bucket == "mid":
+                midfield.append(label)
+            else:
+                defensive.append(label)
+
+        for member in no_members:
+            no_list.append(self.display_label(member))
+
+        offensive.sort()
+        midfield.sort()
+        defensive.sort()
+        no_list.sort()
 
         embed = interaction.message.embeds[0]
         embed.clear_fields()
-        embed.add_field(name="🔥 Offensive", value="\n".join(offensive) if offensive else "-", inline=True)
+        embed.add_field(name="🔥 Angreifer", value="\n".join(offensive) if offensive else "-", inline=True)
         embed.add_field(name="⚙️ Mittelfeld", value="\n".join(midfield) if midfield else "-", inline=True)
         embed.add_field(name="🛡️ Defensive", value="\n".join(defensive) if defensive else "-", inline=True)
         embed.add_field(name="❌ Nein", value="\n".join(no_list) if no_list else "-", inline=False)
@@ -888,9 +963,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @app_commands.describe(
     titel="Name der Abstimmung",
-    datum="Wochentag oder Datum, z. B. Sonntag 20.04.",
-    uhrzeit="Uhrzeit, z. B. 20:30",
-    details="Zweck oder Beschreibung der Abstimmung"
+    datum="Wochentag oder Datum, z. B. Sonntag 27.04.",
+    uhrzeit="Uhrzeit, z. B. 20:30"
 )
 @bot.tree.command(name="verfuegbarkeit", description="Erstellt eine Verfügbarkeitsabfrage")
 async def verfuegbarkeit(
@@ -898,7 +972,6 @@ async def verfuegbarkeit(
     titel: str,
     datum: str,
     uhrzeit: str,
-    details: str,
 ):
     if not isinstance(interaction.user, discord.Member):
         return
@@ -917,10 +990,10 @@ async def verfuegbarkeit(
 
     embed = discord.Embed(
         title=titel,
-        description=f"📅 **Datum:** {datum}\n⏰ **Uhrzeit:** {uhrzeit}\n\n📝 **Zweck:**\n{details}",
+        description=f"📅 **Datum:** {datum}\n⏰ **Uhrzeit:** {uhrzeit}",
         colour=discord.Colour.green(),
     )
-    embed.add_field(name="🔥 Offensive", value="-", inline=True)
+    embed.add_field(name="🔥 Angreifer", value="-", inline=True)
     embed.add_field(name="⚙️ Mittelfeld", value="-", inline=True)
     embed.add_field(name="🛡️ Defensive", value="-", inline=True)
     embed.add_field(name="❌ Nein", value="-", inline=False)
@@ -952,7 +1025,8 @@ async def setup_server(interaction: discord.Interaction):
     await create_role_if_missing(guild, ROLE_FINISHED, discord.Colour.purple())
 
     for pos in POSITIONS:
-        await create_role_if_missing(guild, pos, discord.Colour.dark_grey())
+        await create_role_if_missing(guild, main_role_name(pos), discord.Colour.orange())
+        await create_role_if_missing(guild, side_role_name(pos), discord.Colour.dark_grey())
 
     info_cat = await create_category_if_missing(guild, CATEGORY_INFO)
     chat_cat = await create_category_if_missing(guild, CATEGORY_CHAT)
@@ -1037,14 +1111,16 @@ async def setup_server(interaction: discord.Interaction):
     main_positions_text = (
         "## Hauptpositionen\n"
         "Wähle hier **mindestens 1 und maximal 2 Hauptpositionen**.\n"
-        "Nur diese Hauptpositionen werden in deinen Nicknamen übernommen.\n\n"
+        "Nur diese Hauptpositionen werden in deinen Nicknamen übernommen.\n"
+        "Für Hauptpositionen bekommst du farbige Rollen wie **Haupt-ST**.\n\n"
         "Mit dem roten Button kannst du deine Hauptpositionen zurücksetzen."
     )
 
     side_positions_text = (
         "## Nebenpositionen\n"
         "Wähle hier beliebig viele Nebenpositionen.\n"
-        "Diese werden als Rollen gespeichert, aber **nicht** in deinen Nicknamen übernommen.\n\n"
+        "Diese werden als Rollen gespeichert, aber **nicht** in deinen Nicknamen übernommen.\n"
+        "Für Nebenpositionen bekommst du Rollen wie **Neben-ST**.\n\n"
         "Mit dem roten Button kannst du deine Nebenpositionen zurücksetzen."
     )
 
