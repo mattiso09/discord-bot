@@ -238,6 +238,26 @@ def clean_name_for_availability(member: discord.Member) -> str:
     return raw
 
 
+def parse_main_positions_from_nick(member: discord.Member) -> list[str]:
+    raw = member.nick or member.global_name or member.name or ""
+    raw = raw.strip()
+
+    # Erwartet sowas wie:
+    # #8 | ST/ZOM | Name
+    # oder ST/ZOM | Name
+    match = re.match(r"^(?:#\d{1,2}\s*\|\s*)?([A-Z]{2,4}(?:/[A-Z]{2,4})?)\s*\|", raw)
+    if not match:
+        return []
+
+    part = match.group(1).strip()
+    positions = [p.strip() for p in part.split("/") if p.strip() in POSITIONS]
+    cleaned = []
+    for p in positions:
+        if p in POSITIONS and p not in cleaned:
+            cleaned.append(p)
+    return cleaned[:2]
+
+
 def is_manager(member: discord.Member) -> bool:
     return (
         member.guild_permissions.administrator
@@ -346,6 +366,17 @@ async def sync_position_roles(member: discord.Member):
         await member.remove_roles(*remove_roles, reason="Positionsrollen aktualisiert")
     if add_roles:
         await member.add_roles(*add_roles, reason="Positionsrollen aktualisiert")
+
+
+async def remove_old_plain_position_roles(member: discord.Member):
+    old_roles = [r for r in member.roles if r.name in POSITIONS]
+    if old_roles:
+        try:
+            await member.remove_roles(*old_roles, reason="Alte Positionsrollen durch Haupt/Neben ersetzt")
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
 
 
 async def update_registered_role(member: discord.Member):
@@ -1004,6 +1035,64 @@ async def verfuegbarkeit(
     await interaction.response.send_message("Verfügbarkeitsabfrage wurde erstellt.", ephemeral=True)
 
 
+@bot.tree.command(name="sync_old_positions", description="Wandelt alte Positionsrollen serverweit in Haupt-/Nebenrollen um")
+async def sync_old_positions(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    await interaction.response.send_message("Sync läuft ...", ephemeral=True)
+
+    processed = 0
+    skipped = 0
+
+    for member in guild.members:
+        if member.bot:
+            continue
+
+        await ensure_base_name(member)
+
+        nick_main_positions = parse_main_positions_from_nick(member)
+        if not nick_main_positions:
+            skipped += 1
+            continue
+
+        old_plain_positions = [r.name for r in member.roles if r.name in POSITIONS]
+        old_plain_positions_unique = []
+        for pos in old_plain_positions:
+            if pos not in old_plain_positions_unique:
+                old_plain_positions_unique.append(pos)
+
+        side_positions = [pos for pos in old_plain_positions_unique if pos not in nick_main_positions]
+
+        profile = get_profile(member.id)
+        save_profile(
+            member.id,
+            base_name=profile["base_name"],
+            jersey=profile["jersey"],
+            main_positions=nick_main_positions[:2],
+            side_positions=side_positions,
+        )
+
+        await sync_position_roles(member)
+        await remove_old_plain_position_roles(member)
+        await update_registered_role(member)
+        await update_finished_role(member)
+
+        processed += 1
+
+    await interaction.followup.send(
+        f"Sync fertig. Verarbeitet: **{processed}** | Übersprungen ohne erkennbaren Nickname-Positionsblock: **{skipped}**",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="setup_server", description="Erstellt Rollen, Kanäle und Panels für Vollpfosten CR8")
 async def setup_server(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
@@ -1112,7 +1201,7 @@ async def setup_server(interaction: discord.Interaction):
         "## Hauptpositionen\n"
         "Wähle hier **mindestens 1 und maximal 2 Hauptpositionen**.\n"
         "Nur diese Hauptpositionen werden in deinen Nicknamen übernommen.\n"
-        "Für Hauptpositionen bekommst du farbige Rollen wie **Haupt-ST**.\n\n"
+        "Für Hauptpositionen bekommst du Rollen wie **Haupt-ST**.\n\n"
         "Mit dem roten Button kannst du deine Hauptpositionen zurücksetzen."
     )
 
