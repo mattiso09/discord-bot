@@ -544,31 +544,30 @@ def build_nick(base_name: str, jersey: str | None, main_positions: list[str]) ->
     return base_name[:32]
 
 
-def get_missing_setup_steps(member: discord.Member):
+def next_step_message(member: discord.Member):
     profile = get_profile(member.id)
-    missing = []
 
     if not has_role(member, ROLE_TESTER):
-        missing.append("Regeln im Channel **#regeln** akzeptieren")
+        return "Bitte akzeptiere zuerst die Regeln im Channel **#regeln**."
     if not (1 <= len(profile["main_positions"]) <= 2):
-        missing.append("mindestens 1 und maximal 2 Hauptpositionen wählen")
+        return "Bitte wähle jetzt **mindestens 1 und maximal 2 Hauptpositionen**."
     if len(profile["side_positions"]) < 1:
-        missing.append("mindestens 1 Nebenposition wählen")
+        return "Bitte wähle jetzt **mindestens 1 Nebenposition**."
     if not profile["jersey"]:
-        missing.append("deine Trikotnummer setzen")
-
-    return missing
-
-
-def build_setup_progress_text(member: discord.Member):
-    missing = get_missing_setup_steps(member)
-    if not missing:
-        return "✅ Du bist jetzt vollständig registriert und kannst mitspielen."
-    return "Es fehlt noch:\n- " + "\n- ".join(missing)
+        return "Bitte setze jetzt deine **Trikotnummer**, damit du mitspielen kannst."
+    return "✅ Du bist jetzt vollständig registriert und kannst mitspielen."
 
 
-async def send_setup_dm(member: discord.Member, intro: str):
-    text = f"{intro}\n\n{build_setup_progress_text(member)}"
+async def send_join_dm(member: discord.Member):
+    text = (
+        f"Willkommen auf **{member.guild.name}**.\n\n"
+        "Damit du mitspielen kannst, mach bitte diese Schritte nacheinander:\n"
+        "1. Regeln akzeptieren\n"
+        "2. Hauptpositionen wählen\n"
+        "3. Nebenpositionen wählen\n"
+        "4. Trikotnummer setzen\n\n"
+        f"{next_step_message(member)}"
+    )
     try:
         await member.send(text)
     except discord.Forbidden:
@@ -577,17 +576,10 @@ async def send_setup_dm(member: discord.Member, intro: str):
         pass
 
 
-async def send_rules_channel_hint(member: discord.Member, intro: str):
-    channel = discord.utils.get(member.guild.text_channels, name=CH_RULES)
-    if channel is None:
-        return
-
+async def send_private_progress_dm(member: discord.Member, intro: str):
+    text = f"{intro}\n\n{next_step_message(member)}"
     try:
-        await channel.send(
-            f"{member.mention} {intro}\n{build_setup_progress_text(member)}",
-            delete_after=180,
-            allowed_mentions=discord.AllowedMentions(users=True),
-        )
+        await member.send(text)
     except discord.Forbidden:
         pass
     except discord.HTTPException:
@@ -904,38 +896,40 @@ async def replace_panel_message(channel: discord.TextChannel, marker: str, conte
     await channel.send(f"{marker}\n{content}", view=view)
 
 
+def find_emoji_by_names(guild: discord.Guild, names: list[str]):
+    for name in names:
+        emoji = discord.utils.get(guild.emojis, name=name)
+        if emoji is not None:
+            return emoji
+    return None
+
+
 def get_position_emoji(guild: discord.Guild, pos: str, counters: dict[str, int]):
-    emoji_name = None
-
     if pos == "LF":
-        emoji_name = "LF_RF"
-    elif pos == "RF":
-        emoji_name = "LF_RF2"
-    elif pos == "RV":
-        emoji_name = "RV_LV"
-    elif pos == "LV":
-        emoji_name = "RV_LV2"
-    elif pos == "ST":
+        return find_emoji_by_names(guild, ["LF_RF", "RF_LF"])
+    if pos == "RF":
+        return find_emoji_by_names(guild, ["LF_RF2", "RF_LF2"])
+    if pos == "RV":
+        return find_emoji_by_names(guild, ["RV_LV"])
+    if pos == "LV":
+        return find_emoji_by_names(guild, ["RV_LV2", "LV_RV2"])
+    if pos == "ST":
         count = counters.get("ST", 0)
-        emoji_name = "ST" if count == 0 else "ST2"
         counters["ST"] = count + 1
-    elif pos == "IV":
+        return find_emoji_by_names(guild, ["ST"] if count == 0 else ["ST2", "ST_2"])
+    if pos == "IV":
         count = counters.get("IV", 0)
-        emoji_name = "IV" if count == 0 else "IV2"
         counters["IV"] = count + 1
-    elif pos == "TW":
-        emoji_name = "TW"
-    elif pos == "ZOM":
-        emoji_name = "ZOM"
-    elif pos == "ZDM":
-        emoji_name = "ZDM"
-    elif pos == "ZM":
-        emoji_name = "ZM"
-
-    if emoji_name is None:
-        return None
-
-    return discord.utils.get(guild.emojis, name=emoji_name)
+        return find_emoji_by_names(guild, ["IV"] if count == 0 else ["IV2", "IV_2"])
+    if pos == "TW":
+        return find_emoji_by_names(guild, ["TW"])
+    if pos == "ZOM":
+        return find_emoji_by_names(guild, ["ZOM"])
+    if pos == "ZDM":
+        return find_emoji_by_names(guild, ["ZDM"])
+    if pos == "ZM":
+        return find_emoji_by_names(guild, ["ZM"])
+    return None
 
 
 def build_poll_embed(guild: discord.Guild, poll_row, votes_rows):
@@ -1025,25 +1019,20 @@ async def refresh_poll_message(guild: discord.Guild, poll_id: int, message: disc
         pass
 
 
-async def send_yes_voter_reminder(guild: discord.Guild, poll_row, text: str):
+async def send_yes_voter_reminder_dm(guild: discord.Guild, poll_row, text: str):
     votes = get_votes_for_poll(poll_row["id"])
     yes_ids = [row["user_id"] for row in votes if row["response"] == "yes"]
 
-    if not yes_ids:
-        return
-
-    channel = guild.get_channel(poll_row["channel_id"])
-    if channel is None or not isinstance(channel, discord.TextChannel):
-        return
-
-    mention_text = " ".join(f"<@{uid}>" for uid in yes_ids)
-    try:
-        await channel.send(
-            f"{mention_text}\n{text}",
-            allowed_mentions=discord.AllowedMentions(users=True),
-        )
-    except discord.HTTPException:
-        pass
+    for user_id in yes_ids:
+        member = guild.get_member(user_id)
+        if member is None:
+            continue
+        try:
+            await member.send(text)
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
 
 
 async def maybe_send_threshold_message(guild: discord.Guild, poll_row):
@@ -1146,7 +1135,7 @@ async def process_poll_reminders():
         diff = start_at - now
 
         if not poll_row["remind_60_sent"] and timedelta(minutes=0) < diff <= timedelta(hours=1):
-            await send_yes_voter_reminder(
+            await send_yes_voter_reminder_dm(
                 guild,
                 poll_row,
                 f"⏳ **{poll_row['title']}** geht in ungefähr **1 Stunde** los.",
@@ -1154,7 +1143,7 @@ async def process_poll_reminders():
             mark_poll_reminder_60(poll_row["id"])
 
         if not poll_row["remind_5_sent"] and timedelta(minutes=0) < diff <= timedelta(minutes=5):
-            await send_yes_voter_reminder(
+            await send_yes_voter_reminder_dm(
                 guild,
                 poll_row,
                 f"🚨 **{poll_row['title']}** geht in ungefähr **5 Minuten** los.",
@@ -1202,11 +1191,11 @@ class RulesView(discord.ui.View):
 
         await update_member_profile(interaction.user)
 
-        message = build_setup_progress_text(interaction.user)
-        await interaction.response.send_message(f"Regeln akzeptiert.\n\n{message}", ephemeral=True)
-
-        await send_setup_dm(interaction.user, "Du hast die Regeln akzeptiert.")
-        await send_rules_channel_hint(interaction.user, "Du hast die Regeln akzeptiert.")
+        await interaction.response.send_message(
+            f"Regeln akzeptiert.\n\n{next_step_message(interaction.user)}",
+            ephemeral=True,
+        )
+        await send_private_progress_dm(interaction.user, "Du hast die Regeln akzeptiert.")
 
 
 class MainPositionSelect(discord.ui.Select):
@@ -1240,12 +1229,10 @@ class MainPositionSelect(discord.ui.Select):
 
         await update_member_profile(interaction.user)
         await interaction.response.send_message(
-            f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**\n\n{build_setup_progress_text(interaction.user)}",
+            f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**\n\n{next_step_message(interaction.user)}",
             ephemeral=True,
         )
-
-        await send_setup_dm(interaction.user, "Deine Hauptpositionen wurden gespeichert.")
-        await send_rules_channel_hint(interaction.user, "Deine Hauptpositionen wurden gespeichert.")
+        await send_private_progress_dm(interaction.user, "Deine Hauptpositionen wurden gespeichert.")
 
 
 class MainPositionView(discord.ui.View):
@@ -1274,11 +1261,10 @@ class MainPositionView(discord.ui.View):
 
         await update_member_profile(interaction.user)
         await interaction.followup.send(
-            f"Deine Hauptpositionen wurden zurückgesetzt.\n\n{build_setup_progress_text(interaction.user)}",
+            f"Deine Hauptpositionen wurden zurückgesetzt.\n\n{next_step_message(interaction.user)}",
             ephemeral=True,
         )
-
-        await send_setup_dm(interaction.user, "Deine Hauptpositionen wurden zurückgesetzt.")
+        await send_private_progress_dm(interaction.user, "Deine Hauptpositionen wurden zurückgesetzt.")
 
 
 class SidePositionSelect(discord.ui.Select):
@@ -1313,12 +1299,10 @@ class SidePositionSelect(discord.ui.Select):
         await update_member_profile(interaction.user)
         text = ", ".join(selected) if selected else "keine"
         await interaction.response.send_message(
-            f"Deine Nebenpositionen wurden gesetzt: **{text}**\n\n{build_setup_progress_text(interaction.user)}",
+            f"Deine Nebenpositionen wurden gesetzt: **{text}**\n\n{next_step_message(interaction.user)}",
             ephemeral=True,
         )
-
-        await send_setup_dm(interaction.user, "Deine Nebenpositionen wurden gespeichert.")
-        await send_rules_channel_hint(interaction.user, "Deine Nebenpositionen wurden gespeichert.")
+        await send_private_progress_dm(interaction.user, "Deine Nebenpositionen wurden gespeichert.")
 
 
 class SidePositionView(discord.ui.View):
@@ -1347,11 +1331,10 @@ class SidePositionView(discord.ui.View):
 
         await update_member_profile(interaction.user)
         await interaction.followup.send(
-            f"Deine Nebenpositionen wurden zurückgesetzt.\n\n{build_setup_progress_text(interaction.user)}",
+            f"Deine Nebenpositionen wurden zurückgesetzt.\n\n{next_step_message(interaction.user)}",
             ephemeral=True,
         )
-
-        await send_setup_dm(interaction.user, "Deine Nebenpositionen wurden zurückgesetzt.")
+        await send_private_progress_dm(interaction.user, "Deine Nebenpositionen wurden zurückgesetzt.")
 
 
 class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
@@ -1391,12 +1374,10 @@ class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
 
         await update_member_profile(interaction.user)
         await interaction.response.send_message(
-            f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.\n\n{build_setup_progress_text(interaction.user)}",
+            f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.\n\n{next_step_message(interaction.user)}",
             ephemeral=True,
         )
-
-        await send_setup_dm(interaction.user, "Deine Trikotnummer wurde gespeichert.")
-        await send_rules_channel_hint(interaction.user, "Deine Trikotnummer wurde gespeichert.")
+        await send_private_progress_dm(interaction.user, "Deine Trikotnummer wurde gespeichert.")
 
 
 class NumberView(discord.ui.View):
@@ -1555,8 +1536,7 @@ async def on_member_join(member: discord.Member):
         return
 
     await ensure_base_name(member)
-    await send_setup_dm(member, "Willkommen auf dem Server.")
-    await send_rules_channel_hint(member, "Willkommen auf dem Server.")
+    await send_join_dm(member)
 
 
 @bot.event
