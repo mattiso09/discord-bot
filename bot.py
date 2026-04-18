@@ -505,6 +505,15 @@ def has_role(member: discord.Member, role_name: str) -> bool:
     return any(r.name == role_name for r in member.roles)
 
 
+async def get_fresh_member(member: discord.Member) -> discord.Member:
+    try:
+        fresh = await member.guild.fetch_member(member.id)
+        return fresh
+    except discord.HTTPException:
+        cached = member.guild.get_member(member.id)
+        return cached or member
+
+
 def can_use_profile_system(member: discord.Member) -> bool:
     return (
         has_role(member, ROLE_TESTER)
@@ -559,17 +568,18 @@ def next_step_message(member: discord.Member):
 
 
 async def send_join_dm(member: discord.Member):
+    fresh = await get_fresh_member(member)
     text = (
-        f"Willkommen auf **{member.guild.name}**.\n\n"
+        f"Willkommen auf **{fresh.guild.name}**.\n\n"
         "Damit du mitspielen kannst, mach bitte diese Schritte nacheinander:\n"
         "1. Regeln akzeptieren\n"
         "2. Hauptpositionen wählen\n"
         "3. Nebenpositionen wählen\n"
         "4. Trikotnummer setzen\n\n"
-        f"{next_step_message(member)}"
+        f"{next_step_message(fresh)}"
     )
     try:
-        await member.send(text)
+        await fresh.send(text)
     except discord.Forbidden:
         pass
     except discord.HTTPException:
@@ -577,9 +587,10 @@ async def send_join_dm(member: discord.Member):
 
 
 async def send_private_progress_dm(member: discord.Member, intro: str):
-    text = f"{intro}\n\n{next_step_message(member)}"
+    fresh = await get_fresh_member(member)
+    text = f"{intro}\n\n{next_step_message(fresh)}"
     try:
-        await member.send(text)
+        await fresh.send(text)
     except discord.Forbidden:
         pass
     except discord.HTTPException:
@@ -1189,13 +1200,15 @@ class RulesView(discord.ui.View):
                 await interaction.response.send_message("Fehler beim Vergeben der Rolle **Tester**.", ephemeral=True)
                 return
 
-        await update_member_profile(interaction.user)
+        fresh_member = await get_fresh_member(interaction.user)
+        await update_member_profile(fresh_member)
+        fresh_member = await get_fresh_member(fresh_member)
 
         await interaction.response.send_message(
-            f"Regeln akzeptiert.\n\n{next_step_message(interaction.user)}",
+            f"Regeln akzeptiert.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(interaction.user, "Du hast die Regeln akzeptiert.")
+        await send_private_progress_dm(fresh_member, "Du hast die Regeln akzeptiert.")
 
 
 class MainPositionSelect(discord.ui.Select):
@@ -1227,12 +1240,15 @@ class MainPositionSelect(discord.ui.Select):
             side_positions=profile["side_positions"],
         )
 
-        await update_member_profile(interaction.user)
+        fresh_member = await get_fresh_member(interaction.user)
+        await update_member_profile(fresh_member)
+        fresh_member = await get_fresh_member(fresh_member)
+
         await interaction.response.send_message(
-            f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**\n\n{next_step_message(interaction.user)}",
+            f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(interaction.user, "Deine Hauptpositionen wurden gespeichert.")
+        await send_private_progress_dm(fresh_member, "Deine Hauptpositionen wurden gespeichert.")
 
 
 class MainPositionView(discord.ui.View):
@@ -1259,12 +1275,15 @@ class MainPositionView(discord.ui.View):
             side_positions=profile["side_positions"],
         )
 
-        await update_member_profile(interaction.user)
+        fresh_member = await get_fresh_member(interaction.user)
+        await update_member_profile(fresh_member)
+        fresh_member = await get_fresh_member(fresh_member)
+
         await interaction.followup.send(
-            f"Deine Hauptpositionen wurden zurückgesetzt.\n\n{next_step_message(interaction.user)}",
+            f"Deine Hauptpositionen wurden zurückgesetzt.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(interaction.user, "Deine Hauptpositionen wurden zurückgesetzt.")
+        await send_private_progress_dm(fresh_member, "Deine Hauptpositionen wurden zurückgesetzt.")
 
 
 class SidePositionSelect(discord.ui.Select):
@@ -1296,13 +1315,16 @@ class SidePositionSelect(discord.ui.Select):
             side_positions=selected,
         )
 
-        await update_member_profile(interaction.user)
+        fresh_member = await get_fresh_member(interaction.user)
+        await update_member_profile(fresh_member)
+        fresh_member = await get_fresh_member(fresh_member)
+
         text = ", ".join(selected) if selected else "keine"
         await interaction.response.send_message(
-            f"Deine Nebenpositionen wurden gesetzt: **{text}**\n\n{next_step_message(interaction.user)}",
+            f"Deine Nebenpositionen wurden gesetzt: **{text}**\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(interaction.user, "Deine Nebenpositionen wurden gespeichert.")
+        await send_private_progress_dm(fresh_member, "Deine Nebenpositionen wurden gespeichert.")
 
 
 class SidePositionView(discord.ui.View):
@@ -1329,12 +1351,15 @@ class SidePositionView(discord.ui.View):
             side_positions=[],
         )
 
-        await update_member_profile(interaction.user)
+        fresh_member = await get_fresh_member(interaction.user)
+        await update_member_profile(fresh_member)
+        fresh_member = await get_fresh_member(fresh_member)
+
         await interaction.followup.send(
-            f"Deine Nebenpositionen wurden zurückgesetzt.\n\n{next_step_message(interaction.user)}",
+            f"Deine Nebenpositionen wurden zurückgesetzt.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(interaction.user, "Deine Nebenpositionen wurden zurückgesetzt.")
+        await send_private_progress_dm(fresh_member, "Deine Nebenpositionen wurden zurückgesetzt.")
 
 
 class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
@@ -1372,12 +1397,15 @@ class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
             side_positions=profile["side_positions"],
         )
 
-        await update_member_profile(interaction.user)
+        fresh_member = await get_fresh_member(interaction.user)
+        await update_member_profile(fresh_member)
+        fresh_member = await get_fresh_member(fresh_member)
+
         await interaction.response.send_message(
-            f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.\n\n{next_step_message(interaction.user)}",
+            f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(interaction.user, "Deine Trikotnummer wurde gespeichert.")
+        await send_private_progress_dm(fresh_member, "Deine Trikotnummer wurde gespeichert.")
 
 
 class NumberView(discord.ui.View):
