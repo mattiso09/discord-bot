@@ -2,8 +2,11 @@ import os
 import re
 import json
 import time
+import asyncio
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -22,6 +25,7 @@ if not GUILD_ID_RAW.isdigit():
     raise RuntimeError("GUILD_ID fehlt in der .env Datei oder ist ungültig.")
 
 GUILD_ID = int(GUILD_ID_RAW)
+BOT_TZ = ZoneInfo("Europe/Berlin")
 
 DB_PATH = Path("vollpfosten_cr8.sqlite3")
 SERVER_NAME = "Vollpfosten CR8"
@@ -103,6 +107,16 @@ Mit dem Akzeptieren der Regeln verpflichtest du dich, dich an folgende Punkte zu
 Drücke unten auf den Button, um die Regeln zu akzeptieren und die Rolle **Tester** zu erhalten.
 """
 
+WEEKDAY_DE = {
+    0: "Montag",
+    1: "Dienstag",
+    2: "Mittwoch",
+    3: "Donnerstag",
+    4: "Freitag",
+    5: "Samstag",
+    6: "Sonntag",
+}
+
 
 def main_role_name(pos: str) -> str:
     return f"Haupt-{pos}"
@@ -131,22 +145,97 @@ def init_db():
         )
         """
     )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS polls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            weekday_text TEXT NOT NULL,
+            date_text TEXT NOT NULL,
+            time_text TEXT NOT NULL,
+            start_at TEXT NOT NULL,
+            channel_id INTEGER,
+            message_id INTEGER,
+            created_by INTEGER,
+            yes_threshold_announced INTEGER DEFAULT 0,
+            remind_60_sent INTEGER DEFAULT 0,
+            remind_5_sent INTEGER DEFAULT 0,
+            closed INTEGER DEFAULT 0
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS poll_votes (
+            poll_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            response TEXT NOT NULL,
+            voted_at TEXT NOT NULL,
+            PRIMARY KEY (poll_id, user_id)
+        )
+        """
+    )
     con.commit()
     con.close()
 
 
 def migrate_db():
     con = db()
-    cols = [row["name"] for row in con.execute("PRAGMA table_info(profiles)").fetchall()]
 
-    if "base_name" not in cols:
+    cols_profiles = [row["name"] for row in con.execute("PRAGMA table_info(profiles)").fetchall()]
+    if "base_name" not in cols_profiles:
         con.execute("ALTER TABLE profiles ADD COLUMN base_name TEXT")
-    if "jersey" not in cols:
+    if "jersey" not in cols_profiles:
         con.execute("ALTER TABLE profiles ADD COLUMN jersey TEXT")
-    if "main_positions" not in cols:
+    if "main_positions" not in cols_profiles:
         con.execute("ALTER TABLE profiles ADD COLUMN main_positions TEXT")
-    if "side_positions" not in cols:
+    if "side_positions" not in cols_profiles:
         con.execute("ALTER TABLE profiles ADD COLUMN side_positions TEXT")
+
+    cols_polls = [row["name"] for row in con.execute("PRAGMA table_info(polls)").fetchall()]
+    if not cols_polls:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS polls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                weekday_text TEXT NOT NULL,
+                date_text TEXT NOT NULL,
+                time_text TEXT NOT NULL,
+                start_at TEXT NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                created_by INTEGER,
+                yes_threshold_announced INTEGER DEFAULT 0,
+                remind_60_sent INTEGER DEFAULT 0,
+                remind_5_sent INTEGER DEFAULT 0,
+                closed INTEGER DEFAULT 0
+            )
+            """
+        )
+    else:
+        if "yes_threshold_announced" not in cols_polls:
+            con.execute("ALTER TABLE polls ADD COLUMN yes_threshold_announced INTEGER DEFAULT 0")
+        if "remind_60_sent" not in cols_polls:
+            con.execute("ALTER TABLE polls ADD COLUMN remind_60_sent INTEGER DEFAULT 0")
+        if "remind_5_sent" not in cols_polls:
+            con.execute("ALTER TABLE polls ADD COLUMN remind_5_sent INTEGER DEFAULT 0")
+        if "closed" not in cols_polls:
+            con.execute("ALTER TABLE polls ADD COLUMN closed INTEGER DEFAULT 0")
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS poll_votes (
+            poll_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            response TEXT NOT NULL,
+            voted_at TEXT NOT NULL,
+            PRIMARY KEY (poll_id, user_id)
+        )
+        """
+    )
 
     con.commit()
     con.close()
@@ -166,13 +255,12 @@ def get_profile(user_id: int):
             "side_positions": [],
         }
 
-    keys = row.keys()
     return {
         "user_id": row["user_id"],
-        "base_name": row["base_name"] if "base_name" in keys else None,
-        "jersey": row["jersey"] if "jersey" in keys else None,
-        "main_positions": json.loads(row["main_positions"]) if "main_positions" in keys and row["main_positions"] else [],
-        "side_positions": json.loads(row["side_positions"]) if "side_positions" in keys and row["side_positions"] else [],
+        "base_name": row["base_name"],
+        "jersey": row["jersey"],
+        "main_positions": json.loads(row["main_positions"]) if row["main_positions"] else [],
+        "side_positions": json.loads(row["side_positions"]) if row["side_positions"] else [],
     }
 
 
@@ -211,10 +299,130 @@ def save_profile(user_id: int, base_name=None, jersey=None, main_positions=None,
     con.close()
 
 
+def create_poll_record(kind: str, title: str, weekday_text: str, date_text: str, time_text: str, start_at: datetime, created_by: int | None):
+    con = db()
+    cur = con.execute(
+        """
+        INSERT INTO polls (kind, title, weekday_text, date_text, time_text, start_at, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (kind, title, weekday_text, date_text, time_text, start_at.isoformat(), created_by),
+    )
+    poll_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return poll_id
+
+
+def set_poll_message_info(poll_id: int, channel_id: int, message_id: int):
+    con = db()
+    con.execute(
+        "UPDATE polls SET channel_id = ?, message_id = ? WHERE id = ?",
+        (channel_id, message_id, poll_id),
+    )
+    con.commit()
+    con.close()
+
+
+def get_poll_by_message_id(message_id: int):
+    con = db()
+    row = con.execute("SELECT * FROM polls WHERE message_id = ?", (message_id,)).fetchone()
+    con.close()
+    return row
+
+
+def get_poll_by_id(poll_id: int):
+    con = db()
+    row = con.execute("SELECT * FROM polls WHERE id = ?", (poll_id,)).fetchone()
+    con.close()
+    return row
+
+
+def get_open_polls():
+    con = db()
+    rows = con.execute("SELECT * FROM polls WHERE closed = 0").fetchall()
+    con.close()
+    return rows
+
+
+def upsert_vote(poll_id: int, user_id: int, response: str):
+    con = db()
+    con.execute(
+        """
+        INSERT INTO poll_votes (poll_id, user_id, response, voted_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(poll_id, user_id) DO UPDATE SET
+            response = excluded.response,
+            voted_at = excluded.voted_at
+        """,
+        (poll_id, user_id, response, datetime.now(BOT_TZ).isoformat()),
+    )
+    con.commit()
+    con.close()
+
+
+def delete_vote(poll_id: int, user_id: int):
+    con = db()
+    con.execute(
+        "DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ?",
+        (poll_id, user_id),
+    )
+    con.commit()
+    con.close()
+
+
+def get_votes_for_poll(poll_id: int):
+    con = db()
+    rows = con.execute(
+        "SELECT * FROM poll_votes WHERE poll_id = ? ORDER BY voted_at ASC",
+        (poll_id,),
+    ).fetchall()
+    con.close()
+    return rows
+
+
+def mark_poll_threshold_announced(poll_id: int):
+    con = db()
+    con.execute("UPDATE polls SET yes_threshold_announced = 1 WHERE id = ?", (poll_id,))
+    con.commit()
+    con.close()
+
+
+def mark_poll_reminder_60(poll_id: int):
+    con = db()
+    con.execute("UPDATE polls SET remind_60_sent = 1 WHERE id = ?", (poll_id,))
+    con.commit()
+    con.close()
+
+
+def mark_poll_reminder_5(poll_id: int):
+    con = db()
+    con.execute("UPDATE polls SET remind_5_sent = 1 WHERE id = ?", (poll_id,))
+    con.commit()
+    con.close()
+
+
+def close_poll(poll_id: int):
+    con = db()
+    con.execute("UPDATE polls SET closed = 1 WHERE id = ?", (poll_id,))
+    con.commit()
+    con.close()
+
+
+def daily_poll_exists_for_date(date_text: str):
+    con = db()
+    row = con.execute(
+        "SELECT id FROM polls WHERE kind = 'daily_funclub' AND date_text = ? LIMIT 1",
+        (date_text,),
+    ).fetchone()
+    con.close()
+    return row is not None
+
+
 def strip_managed_nick(name: str) -> str:
     if not name:
         return "Spieler"
-    pattern = r"^(?:#\d{1,2}\s*\|\s*)?(?:[A-Z/]{2,20}(?:/[A-Z/]{2,20})?\s*\|\s*)?"
+    pattern = r"^(?:#\d{1,2}\s*\|\s*)?(?:[A-Z]{2,4}(?:/[A-Z]{2,4})?\s*\|\s*)?"
     stripped = re.sub(pattern, "", name).strip()
     return stripped if stripped else name
 
@@ -226,25 +434,9 @@ def strip_number_from_nick(name: str) -> str:
     return stripped if stripped else name
 
 
-def clean_name_for_availability(member: discord.Member) -> str:
-    profile = get_profile(member.id)
-    base_name = profile["base_name"]
-    if base_name:
-        return base_name
-
-    raw = member.nick or member.global_name or member.name
-    raw = strip_number_from_nick(raw)
-    raw = strip_managed_nick(raw)
-    return raw
-
-
 def parse_main_positions_from_nick(member: discord.Member) -> list[str]:
     raw = member.nick or member.global_name or member.name or ""
     raw = raw.strip()
-
-    # Erwartet sowas wie:
-    # #8 | ST/ZOM | Name
-    # oder ST/ZOM | Name
     match = re.match(r"^(?:#\d{1,2}\s*\|\s*)?([A-Z]{2,4}(?:/[A-Z]{2,4})?)\s*\|", raw)
     if not match:
         return []
@@ -253,9 +445,52 @@ def parse_main_positions_from_nick(member: discord.Member) -> list[str]:
     positions = [p.strip() for p in part.split("/") if p.strip() in POSITIONS]
     cleaned = []
     for p in positions:
-        if p in POSITIONS and p not in cleaned:
+        if p not in cleaned:
             cleaned.append(p)
     return cleaned[:2]
+
+
+def clean_name_for_availability(member: discord.Member) -> str:
+    profile = get_profile(member.id)
+    if profile["base_name"]:
+        return profile["base_name"]
+
+    raw = member.nick or member.global_name or member.name
+    raw = strip_number_from_nick(raw)
+    raw = strip_managed_nick(raw)
+    return raw
+
+
+def get_first_main_position_for_member(member: discord.Member) -> str:
+    profile = get_profile(member.id)
+    if profile["main_positions"]:
+        return profile["main_positions"][0]
+
+    from_nick = parse_main_positions_from_nick(member)
+    if from_nick:
+        return from_nick[0]
+
+    return "?"
+
+
+def get_weekday_text(dt: datetime) -> str:
+    return WEEKDAY_DE[dt.weekday()]
+
+
+def parse_manual_start_datetime(datum: str, uhrzeit: str):
+    try:
+        date_part = datetime.strptime(datum.strip(), "%d.%m.%Y")
+        time_part = datetime.strptime(uhrzeit.strip(), "%H:%M")
+        return datetime(
+            year=date_part.year,
+            month=date_part.month,
+            day=date_part.day,
+            hour=time_part.hour,
+            minute=time_part.minute,
+            tzinfo=BOT_TZ,
+        )
+    except ValueError:
+        return None
 
 
 def is_manager(member: discord.Member) -> bool:
@@ -307,6 +542,56 @@ def build_nick(base_name: str, jersey: str | None, main_positions: list[str]) ->
         return prefix + base_name[:remaining]
 
     return base_name[:32]
+
+
+def get_missing_setup_steps(member: discord.Member):
+    profile = get_profile(member.id)
+    missing = []
+
+    if not has_role(member, ROLE_TESTER):
+        missing.append("Regeln im Channel **#regeln** akzeptieren")
+    if not (1 <= len(profile["main_positions"]) <= 2):
+        missing.append("mindestens 1 und maximal 2 Hauptpositionen wählen")
+    if len(profile["side_positions"]) < 1:
+        missing.append("mindestens 1 Nebenposition wählen")
+    if not profile["jersey"]:
+        missing.append("deine Trikotnummer setzen")
+
+    return missing
+
+
+def build_setup_progress_text(member: discord.Member):
+    missing = get_missing_setup_steps(member)
+    if not missing:
+        return "✅ Du bist jetzt vollständig registriert und kannst mitspielen."
+    return "Es fehlt noch:\n- " + "\n- ".join(missing)
+
+
+async def send_setup_dm(member: discord.Member, intro: str):
+    text = f"{intro}\n\n{build_setup_progress_text(member)}"
+    try:
+        await member.send(text)
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException:
+        pass
+
+
+async def send_rules_channel_hint(member: discord.Member, intro: str):
+    channel = discord.utils.get(member.guild.text_channels, name=CH_RULES)
+    if channel is None:
+        return
+
+    try:
+        await channel.send(
+            f"{member.mention} {intro}\n{build_setup_progress_text(member)}",
+            delete_after=180,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException:
+        pass
 
 
 async def ensure_base_name(member: discord.Member):
@@ -619,6 +904,278 @@ async def replace_panel_message(channel: discord.TextChannel, marker: str, conte
     await channel.send(f"{marker}\n{content}", view=view)
 
 
+def get_position_emoji(guild: discord.Guild, pos: str, counters: dict[str, int]):
+    emoji_name = None
+
+    if pos == "LF":
+        emoji_name = "LF_RF"
+    elif pos == "RF":
+        emoji_name = "LF_RF2"
+    elif pos == "RV":
+        emoji_name = "RV_LV"
+    elif pos == "LV":
+        emoji_name = "RV_LV2"
+    elif pos == "ST":
+        count = counters.get("ST", 0)
+        emoji_name = "ST" if count == 0 else "ST2"
+        counters["ST"] = count + 1
+    elif pos == "IV":
+        count = counters.get("IV", 0)
+        emoji_name = "IV" if count == 0 else "IV2"
+        counters["IV"] = count + 1
+    elif pos == "TW":
+        emoji_name = "TW"
+    elif pos == "ZOM":
+        emoji_name = "ZOM"
+    elif pos == "ZDM":
+        emoji_name = "ZDM"
+    elif pos == "ZM":
+        emoji_name = "ZM"
+
+    if emoji_name is None:
+        return None
+
+    return discord.utils.get(guild.emojis, name=emoji_name)
+
+
+def build_poll_embed(guild: discord.Guild, poll_row, votes_rows):
+    title = poll_row["title"]
+    weekday_text = poll_row["weekday_text"]
+    date_text = poll_row["date_text"]
+    time_text = poll_row["time_text"]
+
+    embed = discord.Embed(
+        title=title,
+        description=f"📅 **{weekday_text}, {date_text}**\n⏰ **{time_text}**",
+        colour=discord.Colour.green(),
+    )
+
+    offensive_lines = []
+    midfield_lines = []
+    defensive_lines = []
+    no_lines = []
+
+    yes_members = []
+    no_members = []
+
+    for vote in votes_rows:
+        member = guild.get_member(vote["user_id"])
+        if member is None:
+            continue
+        if vote["response"] == "yes":
+            yes_members.append((member, vote["voted_at"]))
+        elif vote["response"] == "no":
+            no_members.append(member)
+
+    yes_members.sort(key=lambda x: x[1])
+    no_members.sort(key=lambda m: clean_name_for_availability(m).lower())
+
+    emoji_counters_yes = {"ST": 0, "IV": 0}
+    emoji_counters_no = {"ST": 0, "IV": 0}
+
+    for member, _ in yes_members:
+        pos = get_first_main_position_for_member(member)
+        name = clean_name_for_availability(member)
+        emoji = get_position_emoji(guild, pos, emoji_counters_yes)
+        prefix = str(emoji) if emoji else "•"
+        line = f"{prefix} {pos} | {name}"
+
+        if pos in OFF_POSITIONS:
+            offensive_lines.append(line)
+        elif pos in MID_POSITIONS:
+            midfield_lines.append(line)
+        else:
+            defensive_lines.append(line)
+
+    for member in no_members:
+        pos = get_first_main_position_for_member(member)
+        name = clean_name_for_availability(member)
+        emoji = get_position_emoji(guild, pos, emoji_counters_no)
+        prefix = str(emoji) if emoji else "•"
+        no_lines.append(f"{prefix} {pos} | {name}")
+
+    embed.add_field(name="🔥 Angreifer", value="\n".join(offensive_lines) if offensive_lines else "-", inline=True)
+    embed.add_field(name="⚙️ Mittelfeld", value="\n".join(midfield_lines) if midfield_lines else "-", inline=True)
+    embed.add_field(name="🛡️ Defensive", value="\n".join(defensive_lines) if defensive_lines else "-", inline=True)
+    embed.add_field(name="❌ Nein", value="\n".join(no_lines) if no_lines else "-", inline=False)
+
+    return embed
+
+
+async def refresh_poll_message(guild: discord.Guild, poll_id: int, message: discord.Message | None = None):
+    poll_row = get_poll_by_id(poll_id)
+    if poll_row is None:
+        return
+
+    votes_rows = get_votes_for_poll(poll_id)
+    embed = build_poll_embed(guild, poll_row, votes_rows)
+
+    if message is None:
+        channel = guild.get_channel(poll_row["channel_id"])
+        if channel is None or not isinstance(channel, discord.TextChannel):
+            return
+        try:
+            message = await channel.fetch_message(poll_row["message_id"])
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    try:
+        await message.edit(embed=embed, view=AvailabilityVoteView())
+    except discord.HTTPException:
+        pass
+
+
+async def send_yes_voter_reminder(guild: discord.Guild, poll_row, text: str):
+    votes = get_votes_for_poll(poll_row["id"])
+    yes_ids = [row["user_id"] for row in votes if row["response"] == "yes"]
+
+    if not yes_ids:
+        return
+
+    channel = guild.get_channel(poll_row["channel_id"])
+    if channel is None or not isinstance(channel, discord.TextChannel):
+        return
+
+    mention_text = " ".join(f"<@{uid}>" for uid in yes_ids)
+    try:
+        await channel.send(
+            f"{mention_text}\n{text}",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.HTTPException:
+        pass
+
+
+async def maybe_send_threshold_message(guild: discord.Guild, poll_row):
+    if poll_row["kind"] != "daily_funclub":
+        return
+    if poll_row["yes_threshold_announced"]:
+        return
+
+    votes = get_votes_for_poll(poll_row["id"])
+    yes_count = sum(1 for row in votes if row["response"] == "yes")
+    if yes_count >= 4:
+        channel = guild.get_channel(poll_row["channel_id"])
+        if channel is None or not isinstance(channel, discord.TextChannel):
+            return
+        try:
+            await channel.send("✅ Es sind jetzt mindestens **4 Zusagen** da. Es wird gespielt.")
+            mark_poll_threshold_announced(poll_row["id"])
+        except discord.HTTPException:
+            pass
+
+
+async def create_availability_poll(
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+    kind: str,
+    title: str,
+    weekday_text: str,
+    date_text: str,
+    time_text: str,
+    start_at: datetime,
+    created_by: int | None,
+):
+    poll_id = create_poll_record(kind, title, weekday_text, date_text, time_text, start_at, created_by)
+    poll_row = get_poll_by_id(poll_id)
+    embed = build_poll_embed(guild, poll_row, [])
+
+    try:
+        message = await channel.send(
+            content="@everyone Bitte abstimmen.",
+            embed=embed,
+            view=AvailabilityVoteView(),
+            allowed_mentions=discord.AllowedMentions(everyone=True),
+        )
+    except discord.HTTPException:
+        return
+
+    set_poll_message_info(poll_id, channel.id, message.id)
+
+
+async def maybe_create_daily_funclub_poll():
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+
+    now = datetime.now(BOT_TZ)
+    if now.hour != 12 or now.minute != 0:
+        return
+
+    date_text = now.strftime("%d.%m.%Y")
+    if daily_poll_exists_for_date(date_text):
+        return
+
+    channel = discord.utils.get(guild.text_channels, name=CH_AVAILABILITY)
+    if channel is None:
+        return
+
+    start_at = datetime(now.year, now.month, now.day, 18, 0, tzinfo=BOT_TZ)
+    weekday_text = get_weekday_text(now)
+
+    await create_availability_poll(
+        guild=guild,
+        channel=channel,
+        kind="daily_funclub",
+        title="Funclubben",
+        weekday_text=weekday_text,
+        date_text=date_text,
+        time_text="18:00 - 22:00",
+        start_at=start_at,
+        created_by=None,
+    )
+
+
+async def process_poll_reminders():
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+
+    now = datetime.now(BOT_TZ)
+
+    for poll_row in get_open_polls():
+        try:
+            start_at = datetime.fromisoformat(poll_row["start_at"])
+            if start_at.tzinfo is None:
+                start_at = start_at.replace(tzinfo=BOT_TZ)
+        except ValueError:
+            continue
+
+        await maybe_send_threshold_message(guild, poll_row)
+
+        diff = start_at - now
+
+        if not poll_row["remind_60_sent"] and timedelta(minutes=0) < diff <= timedelta(hours=1):
+            await send_yes_voter_reminder(
+                guild,
+                poll_row,
+                f"⏳ **{poll_row['title']}** geht in ungefähr **1 Stunde** los.",
+            )
+            mark_poll_reminder_60(poll_row["id"])
+
+        if not poll_row["remind_5_sent"] and timedelta(minutes=0) < diff <= timedelta(minutes=5):
+            await send_yes_voter_reminder(
+                guild,
+                poll_row,
+                f"🚨 **{poll_row['title']}** geht in ungefähr **5 Minuten** los.",
+            )
+            mark_poll_reminder_5(poll_row["id"])
+
+        if diff <= timedelta(minutes=-10):
+            close_poll(poll_row["id"])
+
+
+async def background_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await maybe_create_daily_funclub_poll()
+            await process_poll_reminders()
+        except Exception as e:
+            print(f"Fehler im Hintergrundloop: {e}")
+        await asyncio.sleep(60)
+
+
 class RulesView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -633,21 +1190,23 @@ class RulesView(discord.ui.View):
             await interaction.response.send_message("Die Rolle **Tester** existiert nicht.", ephemeral=True)
             return
 
-        if tester_role in interaction.user.roles:
-            await interaction.response.send_message("Du hast die Regeln bereits akzeptiert.", ephemeral=True)
-            return
-
-        try:
-            await interaction.user.add_roles(tester_role, reason="Regeln akzeptiert")
-        except discord.Forbidden:
-            await interaction.response.send_message("Ich darf die Rolle **Tester** nicht vergeben.", ephemeral=True)
-            return
-        except discord.HTTPException:
-            await interaction.response.send_message("Fehler beim Vergeben der Rolle **Tester**.", ephemeral=True)
-            return
+        if tester_role not in interaction.user.roles:
+            try:
+                await interaction.user.add_roles(tester_role, reason="Regeln akzeptiert")
+            except discord.Forbidden:
+                await interaction.response.send_message("Ich darf die Rolle **Tester** nicht vergeben.", ephemeral=True)
+                return
+            except discord.HTTPException:
+                await interaction.response.send_message("Fehler beim Vergeben der Rolle **Tester**.", ephemeral=True)
+                return
 
         await update_member_profile(interaction.user)
-        await interaction.response.send_message("Regeln akzeptiert. Du hast jetzt die Rolle **Tester**.", ephemeral=True)
+
+        message = build_setup_progress_text(interaction.user)
+        await interaction.response.send_message(f"Regeln akzeptiert.\n\n{message}", ephemeral=True)
+
+        await send_setup_dm(interaction.user, "Du hast die Regeln akzeptiert.")
+        await send_rules_channel_hint(interaction.user, "Du hast die Regeln akzeptiert.")
 
 
 class MainPositionSelect(discord.ui.Select):
@@ -680,7 +1239,13 @@ class MainPositionSelect(discord.ui.Select):
         )
 
         await update_member_profile(interaction.user)
-        await interaction.response.send_message(f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**", ephemeral=True)
+        await interaction.response.send_message(
+            f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**\n\n{build_setup_progress_text(interaction.user)}",
+            ephemeral=True,
+        )
+
+        await send_setup_dm(interaction.user, "Deine Hauptpositionen wurden gespeichert.")
+        await send_rules_channel_hint(interaction.user, "Deine Hauptpositionen wurden gespeichert.")
 
 
 class MainPositionView(discord.ui.View):
@@ -708,7 +1273,12 @@ class MainPositionView(discord.ui.View):
         )
 
         await update_member_profile(interaction.user)
-        await interaction.followup.send("Deine Hauptpositionen wurden zurückgesetzt.", ephemeral=True)
+        await interaction.followup.send(
+            f"Deine Hauptpositionen wurden zurückgesetzt.\n\n{build_setup_progress_text(interaction.user)}",
+            ephemeral=True,
+        )
+
+        await send_setup_dm(interaction.user, "Deine Hauptpositionen wurden zurückgesetzt.")
 
 
 class SidePositionSelect(discord.ui.Select):
@@ -742,7 +1312,13 @@ class SidePositionSelect(discord.ui.Select):
 
         await update_member_profile(interaction.user)
         text = ", ".join(selected) if selected else "keine"
-        await interaction.response.send_message(f"Deine Nebenpositionen wurden gesetzt: **{text}**", ephemeral=True)
+        await interaction.response.send_message(
+            f"Deine Nebenpositionen wurden gesetzt: **{text}**\n\n{build_setup_progress_text(interaction.user)}",
+            ephemeral=True,
+        )
+
+        await send_setup_dm(interaction.user, "Deine Nebenpositionen wurden gespeichert.")
+        await send_rules_channel_hint(interaction.user, "Deine Nebenpositionen wurden gespeichert.")
 
 
 class SidePositionView(discord.ui.View):
@@ -770,7 +1346,12 @@ class SidePositionView(discord.ui.View):
         )
 
         await update_member_profile(interaction.user)
-        await interaction.followup.send("Deine Nebenpositionen wurden zurückgesetzt.", ephemeral=True)
+        await interaction.followup.send(
+            f"Deine Nebenpositionen wurden zurückgesetzt.\n\n{build_setup_progress_text(interaction.user)}",
+            ephemeral=True,
+        )
+
+        await send_setup_dm(interaction.user, "Deine Nebenpositionen wurden zurückgesetzt.")
 
 
 class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
@@ -809,7 +1390,13 @@ class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
         )
 
         await update_member_profile(interaction.user)
-        await interaction.response.send_message(f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.", ephemeral=True)
+        await interaction.response.send_message(
+            f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.\n\n{build_setup_progress_text(interaction.user)}",
+            ephemeral=True,
+        )
+
+        await send_setup_dm(interaction.user, "Deine Trikotnummer wurde gespeichert.")
+        await send_rules_channel_hint(interaction.user, "Deine Trikotnummer wurde gespeichert.")
 
 
 class NumberView(discord.ui.View):
@@ -824,113 +1411,97 @@ class NumberView(discord.ui.View):
             pass
 
 
-class AvailabilityView(discord.ui.View):
+class AvailabilityVoteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.yes_ids: set[int] = set()
-        self.no_ids: set[int] = set()
-
-    def first_main_position(self, member: discord.Member) -> str:
-        profile = get_profile(member.id)
-        if profile["main_positions"]:
-            return profile["main_positions"][0]
-        return "?"
-
-    def display_label(self, member: discord.Member) -> str:
-        pos = self.first_main_position(member)
-        name = clean_name_for_availability(member)
-        return f"{pos} | {name}"
-
-    def get_bucket(self, member: discord.Member) -> str:
-        pos = self.first_main_position(member)
-
-        if pos in OFF_POSITIONS:
-            return "off"
-        if pos in MID_POSITIONS:
-            return "mid"
-        if pos in DEF_POSITIONS:
-            return "def"
-        return "def"
-
-    async def rebuild_embed(self, interaction: discord.Interaction):
-        offensive = []
-        midfield = []
-        defensive = []
-        no_list = []
-
-        guild = interaction.guild
-        if guild is None or not interaction.message:
-            return
-
-        yes_members = []
-        for user_id in self.yes_ids:
-            member = guild.get_member(user_id)
-            if member is not None:
-                yes_members.append(member)
-
-        no_members = []
-        for user_id in self.no_ids:
-            member = guild.get_member(user_id)
-            if member is not None:
-                no_members.append(member)
-
-        for member in yes_members:
-            label = self.display_label(member)
-            bucket = self.get_bucket(member)
-
-            if bucket == "off":
-                offensive.append(label)
-            elif bucket == "mid":
-                midfield.append(label)
-            else:
-                defensive.append(label)
-
-        for member in no_members:
-            no_list.append(self.display_label(member))
-
-        offensive.sort()
-        midfield.sort()
-        defensive.sort()
-        no_list.sort()
-
-        embed = interaction.message.embeds[0]
-        embed.clear_fields()
-        embed.add_field(name="🔥 Angreifer", value="\n".join(offensive) if offensive else "-", inline=True)
-        embed.add_field(name="⚙️ Mittelfeld", value="\n".join(midfield) if midfield else "-", inline=True)
-        embed.add_field(name="🛡️ Defensive", value="\n".join(defensive) if defensive else "-", inline=True)
-        embed.add_field(name="❌ Nein", value="\n".join(no_list) if no_list else "-", inline=False)
-
-        await interaction.message.edit(embed=embed, view=self)
 
     @discord.ui.button(label="✅ Ja", style=discord.ButtonStyle.success, custom_id="vcr8:availability:yes")
     async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             return
+
         if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+            await interaction.response.send_message(
+                "Du brauchst dafür die Rolle **Fertig**.",
+                ephemeral=True,
+            )
             return
 
-        self.no_ids.discard(interaction.user.id)
-        self.yes_ids.add(interaction.user.id)
+        poll_row = get_poll_by_message_id(interaction.message.id)
+        if poll_row is None:
+            await interaction.response.send_message(
+                "Diese Abstimmung wurde nicht gefunden.",
+                ephemeral=True,
+            )
+            return
+
+        upsert_vote(poll_row["id"], interaction.user.id, "yes")
 
         await interaction.response.defer(ephemeral=True)
-        await self.rebuild_embed(interaction)
-        await interaction.followup.send("Du wurdest als **Ja** eingetragen.", ephemeral=True)
+        await refresh_poll_message(interaction.guild, poll_row["id"], interaction.message)
+        await maybe_send_threshold_message(interaction.guild, poll_row)
+        await interaction.followup.send(
+            "Deine Stimme wurde auf **Ja** gesetzt.",
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="❌ Nein", style=discord.ButtonStyle.danger, custom_id="vcr8:availability:no")
     async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             return
+
         if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+            await interaction.response.send_message(
+                "Du brauchst dafür die Rolle **Fertig**.",
+                ephemeral=True,
+            )
             return
 
-        self.yes_ids.discard(interaction.user.id)
-        self.no_ids.add(interaction.user.id)
+        poll_row = get_poll_by_message_id(interaction.message.id)
+        if poll_row is None:
+            await interaction.response.send_message(
+                "Diese Abstimmung wurde nicht gefunden.",
+                ephemeral=True,
+            )
+            return
+
+        upsert_vote(poll_row["id"], interaction.user.id, "no")
 
         await interaction.response.defer(ephemeral=True)
-        await self.rebuild_embed(interaction)
-        await interaction.followup.send("Du wurdest als **Nein** eingetragen.", ephemeral=True)
+        await refresh_poll_message(interaction.guild, poll_row["id"], interaction.message)
+        await interaction.followup.send(
+            "Deine Stimme wurde auf **Nein** gesetzt.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🗑️ Stimme entfernen", style=discord.ButtonStyle.secondary, custom_id="vcr8:availability:remove")
+    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not has_role(interaction.user, ROLE_FINISHED):
+            await interaction.response.send_message(
+                "Du brauchst dafür die Rolle **Fertig**.",
+                ephemeral=True,
+            )
+            return
+
+        poll_row = get_poll_by_message_id(interaction.message.id)
+        if poll_row is None:
+            await interaction.response.send_message(
+                "Diese Abstimmung wurde nicht gefunden.",
+                ephemeral=True,
+            )
+            return
+
+        delete_vote(poll_row["id"], interaction.user.id)
+
+        await interaction.response.defer(ephemeral=True)
+        await refresh_poll_message(interaction.guild, poll_row["id"], interaction.message)
+        await interaction.followup.send(
+            "Deine Stimme wurde entfernt. Du kannst jetzt wieder neu abstimmen.",
+            ephemeral=True,
+        )
 
 
 intents = discord.Intents.default()
@@ -940,6 +1511,7 @@ intents.members = True
 class VollpfostenBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
+        self.background_task = None
 
     async def setup_hook(self):
         init_db()
@@ -949,6 +1521,7 @@ class VollpfostenBot(commands.Bot):
         self.add_view(MainPositionView())
         self.add_view(SidePositionView())
         self.add_view(NumberView())
+        self.add_view(AvailabilityVoteView())
 
         guild_obj = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild_obj)
@@ -957,6 +1530,9 @@ class VollpfostenBot(commands.Bot):
         print(f"Sync für Guild {GUILD_ID}: {len(synced)} Commands")
         for cmd in synced:
             print(f"- /{cmd.name}")
+
+        if self.background_task is None:
+            self.background_task = asyncio.create_task(background_loop())
 
 
 bot = VollpfostenBot()
@@ -977,7 +1553,10 @@ async def on_ready():
 async def on_member_join(member: discord.Member):
     if member.guild.id != GUILD_ID:
         return
+
     await ensure_base_name(member)
+    await send_setup_dm(member, "Willkommen auf dem Server.")
+    await send_rules_channel_hint(member, "Willkommen auf dem Server.")
 
 
 @bot.event
@@ -994,8 +1573,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @app_commands.describe(
     titel="Name der Abstimmung",
-    datum="Wochentag oder Datum, z. B. Sonntag 27.04.",
-    uhrzeit="Uhrzeit, z. B. 20:30"
+    datum="Datum im Format TT.MM.JJJJ",
+    uhrzeit="Uhrzeit im Format HH:MM"
 )
 @bot.tree.command(name="verfuegbarkeit", description="Erstellt eine Verfügbarkeitsabfrage")
 async def verfuegbarkeit(
@@ -1019,19 +1598,30 @@ async def verfuegbarkeit(
         await interaction.response.send_message("Der Kanal **verfuegbarkeit** existiert nicht.", ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title=titel,
-        description=f"📅 **Datum:** {datum}\n⏰ **Uhrzeit:** {uhrzeit}",
-        colour=discord.Colour.green(),
-    )
-    embed.add_field(name="🔥 Angreifer", value="-", inline=True)
-    embed.add_field(name="⚙️ Mittelfeld", value="-", inline=True)
-    embed.add_field(name="🛡️ Defensive", value="-", inline=True)
-    embed.add_field(name="❌ Nein", value="-", inline=False)
-    embed.set_footer(text=f"Erstellt von {interaction.user.display_name}")
+    start_at = parse_manual_start_datetime(datum, uhrzeit)
+    if start_at is None:
+        await interaction.response.send_message(
+            "Bitte Datum als **TT.MM.JJJJ** und Uhrzeit als **HH:MM** angeben.",
+            ephemeral=True,
+        )
+        return
 
-    view = AvailabilityView()
-    await channel.send(embed=embed, view=view)
+    weekday_text = get_weekday_text(start_at)
+    date_text = start_at.strftime("%d.%m.%Y")
+    time_text = start_at.strftime("%H:%M")
+
+    await create_availability_poll(
+        guild=guild,
+        channel=channel,
+        kind="manual",
+        title=titel,
+        weekday_text=weekday_text,
+        date_text=date_text,
+        time_text=time_text,
+        start_at=start_at,
+        created_by=interaction.user.id,
+    )
+
     await interaction.response.send_message("Verfügbarkeitsabfrage wurde erstellt.", ephemeral=True)
 
 
@@ -1061,6 +1651,7 @@ async def sync_old_positions(interaction: discord.Interaction):
         nick_main_positions = parse_main_positions_from_nick(member)
         if not nick_main_positions:
             skipped += 1
+            await asyncio.sleep(1.5)
             continue
 
         old_plain_positions = [r.name for r in member.roles if r.name in POSITIONS]
@@ -1086,6 +1677,7 @@ async def sync_old_positions(interaction: discord.Interaction):
         await update_finished_role(member)
 
         processed += 1
+        await asyncio.sleep(1.5)
 
     await interaction.followup.send(
         f"Sync fertig. Verarbeitet: **{processed}** | Übersprungen ohne erkennbaren Nickname-Positionsblock: **{skipped}**",
