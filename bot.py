@@ -107,6 +107,8 @@ Mit dem Akzeptieren der Regeln verpflichtest du dich, dich an folgende Punkte zu
 Drücke unten auf den Button, um die Regeln zu akzeptieren und die Rolle **Tester** zu erhalten.
 """
 
+POLL_NOTE = "Hinweis: Du musst **nicht** exakt zur angegebenen Startzeit da sein."
+
 WEEKDAY_DE = {
     0: "Montag",
     1: "Dienstag",
@@ -134,6 +136,7 @@ def db():
 
 def init_db():
     con = db()
+
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS profiles (
@@ -145,6 +148,7 @@ def init_db():
         )
         """
     )
+
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS polls (
@@ -158,6 +162,7 @@ def init_db():
             channel_id INTEGER,
             message_id INTEGER,
             created_by INTEGER,
+            auto_created INTEGER DEFAULT 0,
             yes_threshold_announced INTEGER DEFAULT 0,
             remind_60_sent INTEGER DEFAULT 0,
             remind_5_sent INTEGER DEFAULT 0,
@@ -165,17 +170,39 @@ def init_db():
         )
         """
     )
+
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS poll_votes (
             poll_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
             response TEXT NOT NULL,
+            later_time TEXT,
             voted_at TEXT NOT NULL,
             PRIMARY KEY (poll_id, user_id)
         )
         """
     )
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS nonvote_warnings (
+            user_id INTEGER PRIMARY KEY,
+            missed_count INTEGER DEFAULT 0,
+            last_warned_at_count INTEGER DEFAULT 0
+        )
+        """
+    )
+
     con.commit()
     con.close()
 
@@ -194,48 +221,23 @@ def migrate_db():
         con.execute("ALTER TABLE profiles ADD COLUMN side_positions TEXT")
 
     cols_polls = [row["name"] for row in con.execute("PRAGMA table_info(polls)").fetchall()]
-    if not cols_polls:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS polls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                title TEXT NOT NULL,
-                weekday_text TEXT NOT NULL,
-                date_text TEXT NOT NULL,
-                time_text TEXT NOT NULL,
-                start_at TEXT NOT NULL,
-                channel_id INTEGER,
-                message_id INTEGER,
-                created_by INTEGER,
-                yes_threshold_announced INTEGER DEFAULT 0,
-                remind_60_sent INTEGER DEFAULT 0,
-                remind_5_sent INTEGER DEFAULT 0,
-                closed INTEGER DEFAULT 0
-            )
-            """
-        )
-    else:
-        if "yes_threshold_announced" not in cols_polls:
-            con.execute("ALTER TABLE polls ADD COLUMN yes_threshold_announced INTEGER DEFAULT 0")
-        if "remind_60_sent" not in cols_polls:
-            con.execute("ALTER TABLE polls ADD COLUMN remind_60_sent INTEGER DEFAULT 0")
-        if "remind_5_sent" not in cols_polls:
-            con.execute("ALTER TABLE polls ADD COLUMN remind_5_sent INTEGER DEFAULT 0")
-        if "closed" not in cols_polls:
-            con.execute("ALTER TABLE polls ADD COLUMN closed INTEGER DEFAULT 0")
+    if "auto_created" not in cols_polls:
+        con.execute("ALTER TABLE polls ADD COLUMN auto_created INTEGER DEFAULT 0")
+    if "yes_threshold_announced" not in cols_polls:
+        con.execute("ALTER TABLE polls ADD COLUMN yes_threshold_announced INTEGER DEFAULT 0")
+    if "remind_60_sent" not in cols_polls:
+        con.execute("ALTER TABLE polls ADD COLUMN remind_60_sent INTEGER DEFAULT 0")
+    if "remind_5_sent" not in cols_polls:
+        con.execute("ALTER TABLE polls ADD COLUMN remind_5_sent INTEGER DEFAULT 0")
+    if "closed" not in cols_polls:
+        con.execute("ALTER TABLE polls ADD COLUMN closed INTEGER DEFAULT 0")
 
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS poll_votes (
-            poll_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            response TEXT NOT NULL,
-            voted_at TEXT NOT NULL,
-            PRIMARY KEY (poll_id, user_id)
-        )
-        """
-    )
+    cols_votes = [row["name"] for row in con.execute("PRAGMA table_info(poll_votes)").fetchall()]
+    if "later_time" not in cols_votes:
+        try:
+            con.execute("ALTER TABLE poll_votes ADD COLUMN later_time TEXT")
+        except sqlite3.OperationalError:
+            pass
 
     con.commit()
     con.close()
@@ -299,14 +301,14 @@ def save_profile(user_id: int, base_name=None, jersey=None, main_positions=None,
     con.close()
 
 
-def create_poll_record(kind: str, title: str, weekday_text: str, date_text: str, time_text: str, start_at: datetime, created_by: int | None):
+def create_poll_record(kind: str, title: str, weekday_text: str, date_text: str, time_text: str, start_at: datetime, created_by: int | None, auto_created: bool):
     con = db()
     cur = con.execute(
         """
-        INSERT INTO polls (kind, title, weekday_text, date_text, time_text, start_at, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO polls (kind, title, weekday_text, date_text, time_text, start_at, created_by, auto_created)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (kind, title, weekday_text, date_text, time_text, start_at.isoformat(), created_by),
+        (kind, title, weekday_text, date_text, time_text, start_at.isoformat(), created_by, 1 if auto_created else 0),
     )
     poll_id = cur.lastrowid
     con.commit()
@@ -345,17 +347,34 @@ def get_open_polls():
     return rows
 
 
-def upsert_vote(poll_id: int, user_id: int, response: str):
+def get_latest_poll_message_id_for_channel(channel_id: int):
+    con = db()
+    row = con.execute(
+        """
+        SELECT message_id
+        FROM polls
+        WHERE channel_id = ? AND message_id IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (channel_id,),
+    ).fetchone()
+    con.close()
+    return row["message_id"] if row else None
+
+
+def upsert_vote(poll_id: int, user_id: int, response: str, later_time: str | None = None):
     con = db()
     con.execute(
         """
-        INSERT INTO poll_votes (poll_id, user_id, response, voted_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO poll_votes (poll_id, user_id, response, later_time, voted_at)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(poll_id, user_id) DO UPDATE SET
             response = excluded.response,
+            later_time = excluded.later_time,
             voted_at = excluded.voted_at
         """,
-        (poll_id, user_id, response, datetime.now(BOT_TZ).isoformat()),
+        (poll_id, user_id, response, later_time, datetime.now(BOT_TZ).isoformat()),
     )
     con.commit()
     con.close()
@@ -417,6 +436,95 @@ def daily_poll_exists_for_date(date_text: str):
     ).fetchone()
     con.close()
     return row is not None
+
+
+def get_setting(key: str, default: str | None = None):
+    con = db()
+    row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    con.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    con = db()
+    con.execute(
+        """
+        INSERT INTO settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+    con.commit()
+    con.close()
+
+
+def is_auto_availability_enabled():
+    return get_setting("auto_availability_enabled", "1") == "1"
+
+
+def get_warning_info(user_id: int):
+    con = db()
+    row = con.execute(
+        "SELECT * FROM nonvote_warnings WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    con.close()
+    if row is None:
+        return {"user_id": user_id, "missed_count": 0, "last_warned_at_count": 0}
+    return dict(row)
+
+
+def increase_missed_vote(user_id: int):
+    info = get_warning_info(user_id)
+    new_count = info["missed_count"] + 1
+
+    con = db()
+    con.execute(
+        """
+        INSERT INTO nonvote_warnings (user_id, missed_count, last_warned_at_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET missed_count = excluded.missed_count
+        """,
+        (user_id, new_count, info["last_warned_at_count"]),
+    )
+    con.commit()
+    con.close()
+    return new_count, info["last_warned_at_count"]
+
+
+def mark_warned_count(user_id: int, count: int):
+    info = get_warning_info(user_id)
+    con = db()
+    con.execute(
+        """
+        INSERT INTO nonvote_warnings (user_id, missed_count, last_warned_at_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            missed_count = excluded.missed_count,
+            last_warned_at_count = excluded.last_warned_at_count
+        """,
+        (user_id, info["missed_count"], count),
+    )
+    con.commit()
+    con.close()
+
+
+def reset_missed_vote_count(user_id: int):
+    info = get_warning_info(user_id)
+    con = db()
+    con.execute(
+        """
+        INSERT INTO nonvote_warnings (user_id, missed_count, last_warned_at_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            missed_count = excluded.missed_count,
+            last_warned_at_count = excluded.last_warned_at_count
+        """,
+        (user_id, 0, info["last_warned_at_count"]),
+    )
+    con.commit()
+    con.close()
 
 
 def strip_managed_nick(name: str) -> str:
@@ -491,6 +599,52 @@ def parse_manual_start_datetime(datum: str, uhrzeit: str):
         )
     except ValueError:
         return None
+
+
+def parse_hhmm(time_str: str):
+    try:
+        t = datetime.strptime(time_str.strip(), "%H:%M")
+        return t.hour, t.minute
+    except ValueError:
+        return None
+
+
+def calculate_recommended_start(votes_rows, start_at: datetime):
+    yes_count = sum(1 for v in votes_rows if v["response"] == "yes")
+    later_votes = [v for v in votes_rows if v["response"] == "later" and v["later_time"]]
+
+    if yes_count >= 4:
+        return start_at.strftime("%H:%M"), 0
+
+    needed = 4 - yes_count
+    if len(later_votes) < needed:
+        return None, needed
+
+    parsed_later = []
+    for row in later_votes:
+        parsed = parse_hhmm(row["later_time"])
+        if parsed is None:
+            continue
+        hour, minute = parsed
+        later_dt = datetime(
+            year=start_at.year,
+            month=start_at.month,
+            day=start_at.day,
+            hour=hour,
+            minute=minute,
+            tzinfo=BOT_TZ,
+        )
+        if later_dt < start_at:
+            later_dt = start_at
+        parsed_later.append(later_dt)
+
+    if len(parsed_later) < needed:
+        return None, needed
+
+    parsed_later.sort()
+    relevant = parsed_later[:needed]
+    recommended = max(relevant)
+    return recommended.strftime("%H:%M"), needed
 
 
 def is_manager(member: discord.Member) -> bool:
@@ -949,9 +1103,20 @@ def build_poll_embed(guild: discord.Guild, poll_row, votes_rows):
     date_text = poll_row["date_text"]
     time_text = poll_row["time_text"]
 
+    try:
+        start_at = datetime.fromisoformat(poll_row["start_at"])
+        if start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=BOT_TZ)
+    except ValueError:
+        start_at = datetime.now(BOT_TZ)
+
     embed = discord.Embed(
         title=title,
-        description=f"📅 **{weekday_text}, {date_text}**\n⏰ **{time_text}**",
+        description=(
+            f"📅 **{weekday_text}, {date_text}**\n"
+            f"⏰ **{time_text}**\n\n"
+            f"{POLL_NOTE}"
+        ),
         colour=discord.Colour.green(),
     )
 
@@ -960,30 +1125,34 @@ def build_poll_embed(guild: discord.Guild, poll_row, votes_rows):
     defensive_lines = []
     no_lines = []
 
-    yes_members = []
+    yes_like_members = []
     no_members = []
 
     for vote in votes_rows:
         member = guild.get_member(vote["user_id"])
         if member is None:
             continue
-        if vote["response"] == "yes":
-            yes_members.append((member, vote["voted_at"]))
+        if vote["response"] in ("yes", "later"):
+            yes_like_members.append((member, vote["voted_at"], vote["response"], vote["later_time"]))
         elif vote["response"] == "no":
             no_members.append(member)
 
-    yes_members.sort(key=lambda x: x[1])
+    yes_like_members.sort(key=lambda x: x[1])
     no_members.sort(key=lambda m: clean_name_for_availability(m).lower())
 
     emoji_counters_yes = {"ST": 0, "IV": 0}
     emoji_counters_no = {"ST": 0, "IV": 0}
 
-    for member, _ in yes_members:
+    for member, _, response, later_time in yes_like_members:
         pos = get_first_main_position_for_member(member)
         name = clean_name_for_availability(member)
         emoji = get_position_emoji(guild, pos, emoji_counters_yes)
         prefix = str(emoji) if emoji else "•"
-        line = f"{prefix} {pos} | {name}"
+
+        if response == "later" and later_time:
+            line = f"{prefix} {pos} | {name} – {later_time}"
+        else:
+            line = f"{prefix} {pos} | {name}"
 
         if pos in OFF_POSITIONS:
             offensive_lines.append(line)
@@ -1003,6 +1172,20 @@ def build_poll_embed(guild: discord.Guild, poll_row, votes_rows):
     embed.add_field(name="⚙️ Mittelfeld", value="\n".join(midfield_lines) if midfield_lines else "-", inline=True)
     embed.add_field(name="🛡️ Defensive", value="\n".join(defensive_lines) if defensive_lines else "-", inline=True)
     embed.add_field(name="❌ Nein", value="\n".join(no_lines) if no_lines else "-", inline=False)
+
+    recommended_time, needed = calculate_recommended_start(votes_rows, start_at)
+    if recommended_time:
+        embed.add_field(
+            name="⏰ Empfohlene Startzeit",
+            value=recommended_time,
+            inline=False,
+        )
+    elif needed > 0:
+        embed.add_field(
+            name="⏰ Empfohlene Startzeit",
+            value=f"Noch nicht genug Zusagen. Es fehlen mindestens **{needed}** weitere verfügbare Spieler.",
+            inline=False,
+        )
 
     return embed
 
@@ -1032,9 +1215,9 @@ async def refresh_poll_message(guild: discord.Guild, poll_id: int, message: disc
 
 async def send_yes_voter_reminder_dm(guild: discord.Guild, poll_row, text: str):
     votes = get_votes_for_poll(poll_row["id"])
-    yes_ids = [row["user_id"] for row in votes if row["response"] == "yes"]
+    available_ids = [row["user_id"] for row in votes if row["response"] in ("yes", "later")]
 
-    for user_id in yes_ids:
+    for user_id in available_ids:
         member = guild.get_member(user_id)
         if member is None:
             continue
@@ -1047,22 +1230,92 @@ async def send_yes_voter_reminder_dm(guild: discord.Guild, poll_row, text: str):
 
 
 async def maybe_send_threshold_message(guild: discord.Guild, poll_row):
-    if poll_row["kind"] != "daily_funclub":
-        return
     if poll_row["yes_threshold_announced"]:
         return
 
     votes = get_votes_for_poll(poll_row["id"])
-    yes_count = sum(1 for row in votes if row["response"] == "yes")
-    if yes_count >= 4:
+    available_count = sum(1 for row in votes if row["response"] in ("yes", "later"))
+
+    if available_count >= 4:
         channel = guild.get_channel(poll_row["channel_id"])
         if channel is None or not isinstance(channel, discord.TextChannel):
             return
+
         try:
-            await channel.send("✅ Es sind jetzt mindestens **4 Zusagen** da. Es wird gespielt.")
+            start_at = datetime.fromisoformat(poll_row["start_at"])
+            if start_at.tzinfo is None:
+                start_at = start_at.replace(tzinfo=BOT_TZ)
+        except ValueError:
+            start_at = datetime.now(BOT_TZ)
+
+        recommended_time, _ = calculate_recommended_start(votes, start_at)
+        extra = f"\n⏰ Empfohlene Startzeit: **{recommended_time}**" if recommended_time else ""
+
+        try:
+            await channel.send(f"✅ Es sind jetzt mindestens **4 verfügbare Spieler** da. Es kann gespielt werden.{extra}")
             mark_poll_threshold_announced(poll_row["id"])
         except discord.HTTPException:
             pass
+
+
+async def notify_nonvoters(guild: discord.Guild, poll_row):
+    votes = get_votes_for_poll(poll_row["id"])
+    voted_ids = {row["user_id"] for row in votes}
+
+    managers = [m for m in guild.members if has_role(m, ROLE_MANAGER)]
+    finished_members = [m for m in guild.members if not m.bot and has_role(m, ROLE_FINISHED)]
+
+    for member in finished_members:
+        if member.id in voted_ids:
+            reset_missed_vote_count(member.id)
+            continue
+
+        missed_count, last_warned_count = increase_missed_vote(member.id)
+
+        if missed_count >= 5 and last_warned_count < 5:
+            for manager in managers:
+                try:
+                    await manager.send(
+                        f"⚠️ {member.display_name} hat **5-mal nicht** bei Verfügbarkeitsabfragen abgestimmt."
+                    )
+                except discord.Forbidden:
+                    pass
+                except discord.HTTPException:
+                    pass
+
+            try:
+                await member.send(
+                    "⚠️ Du hast **5-mal nicht** bei Verfügbarkeitsabfragen abgestimmt. "
+                    "Bitte stimme in Zukunft immer ab."
+                )
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
+
+            mark_warned_count(member.id, 5)
+
+
+async def cleanup_expired_poll_message(guild: discord.Guild, poll_row):
+    channel = guild.get_channel(poll_row["channel_id"])
+    if channel is None or not isinstance(channel, discord.TextChannel):
+        return
+
+    latest_message_id = get_latest_poll_message_id_for_channel(channel.id)
+    if latest_message_id == poll_row["message_id"]:
+        return
+
+    try:
+        msg = await channel.fetch_message(poll_row["message_id"])
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+
+    try:
+        await msg.delete()
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException:
+        pass
 
 
 async def create_availability_poll(
@@ -1075,8 +1328,9 @@ async def create_availability_poll(
     time_text: str,
     start_at: datetime,
     created_by: int | None,
+    auto_created: bool,
 ):
-    poll_id = create_poll_record(kind, title, weekday_text, date_text, time_text, start_at, created_by)
+    poll_id = create_poll_record(kind, title, weekday_text, date_text, time_text, start_at, created_by, auto_created=auto_created)
     poll_row = get_poll_by_id(poll_id)
     embed = build_poll_embed(guild, poll_row, [])
 
@@ -1094,6 +1348,9 @@ async def create_availability_poll(
 
 
 async def maybe_create_daily_funclub_poll():
+    if not is_auto_availability_enabled():
+        return
+
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
         return
@@ -1123,6 +1380,7 @@ async def maybe_create_daily_funclub_poll():
         time_text="18:00 - 22:00",
         start_at=start_at,
         created_by=None,
+        auto_created=True,
     )
 
 
@@ -1149,7 +1407,7 @@ async def process_poll_reminders():
             await send_yes_voter_reminder_dm(
                 guild,
                 poll_row,
-                f"⏳ **{poll_row['title']}** geht in ungefähr **1 Stunde** los.",
+                f"⏳ **{poll_row['title']}** geht in ungefähr **1 Stunde** los.\n{POLL_NOTE}",
             )
             mark_poll_reminder_60(poll_row["id"])
 
@@ -1157,11 +1415,13 @@ async def process_poll_reminders():
             await send_yes_voter_reminder_dm(
                 guild,
                 poll_row,
-                f"🚨 **{poll_row['title']}** geht in ungefähr **5 Minuten** los.",
+                f"🚨 **{poll_row['title']}** geht in ungefähr **5 Minuten** los.\n{POLL_NOTE}",
             )
             mark_poll_reminder_5(poll_row["id"])
 
-        if diff <= timedelta(minutes=-10):
+        if diff <= timedelta(minutes=0):
+            await notify_nonvoters(guild, poll_row)
+            await cleanup_expired_poll_message(guild, poll_row)
             close_poll(poll_row["id"])
 
 
@@ -1420,6 +1680,43 @@ class NumberView(discord.ui.View):
             pass
 
 
+class LaterModal(discord.ui.Modal, title="Wann kommst du später dazu?"):
+    later_time = discord.ui.TextInput(
+        label="Uhrzeit (HH:MM)",
+        placeholder="z.B. 19:30",
+        required=True,
+        max_length=5,
+    )
+
+    def __init__(self, poll_id: int):
+        super().__init__()
+        self.poll_id = poll_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not has_role(interaction.user, ROLE_FINISHED):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+            return
+
+        raw = self.later_time.value.strip()
+        if parse_hhmm(raw) is None:
+            await interaction.response.send_message("Bitte die Uhrzeit als **HH:MM** eingeben, z. B. **19:30**.", ephemeral=True)
+            return
+
+        upsert_vote(self.poll_id, interaction.user.id, "later", later_time=raw)
+
+        await interaction.response.defer(ephemeral=True)
+
+        poll_row = get_poll_by_id(self.poll_id)
+        if poll_row is not None:
+            await refresh_poll_message(interaction.guild, self.poll_id)
+            await maybe_send_threshold_message(interaction.guild, poll_row)
+
+        await interaction.followup.send("Du wurdest als **Komme später** eingetragen.", ephemeral=True)
+
+
 class AvailabilityVoteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1430,29 +1727,36 @@ class AvailabilityVoteView(discord.ui.View):
             return
 
         if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message(
-                "Du brauchst dafür die Rolle **Fertig**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
             return
 
         poll_row = get_poll_by_message_id(interaction.message.id)
         if poll_row is None:
-            await interaction.response.send_message(
-                "Diese Abstimmung wurde nicht gefunden.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Diese Abstimmung wurde nicht gefunden.", ephemeral=True)
             return
 
-        upsert_vote(poll_row["id"], interaction.user.id, "yes")
+        upsert_vote(poll_row["id"], interaction.user.id, "yes", later_time=None)
 
         await interaction.response.defer(ephemeral=True)
         await refresh_poll_message(interaction.guild, poll_row["id"], interaction.message)
         await maybe_send_threshold_message(interaction.guild, poll_row)
-        await interaction.followup.send(
-            "Deine Stimme wurde auf **Ja** gesetzt.",
-            ephemeral=True,
-        )
+        await interaction.followup.send("Deine Stimme wurde auf **Ja** gesetzt.", ephemeral=True)
+
+    @discord.ui.button(label="🕒 Komme später", style=discord.ButtonStyle.primary, custom_id="vcr8:availability:later")
+    async def later_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            return
+
+        if not has_role(interaction.user, ROLE_FINISHED):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+            return
+
+        poll_row = get_poll_by_message_id(interaction.message.id)
+        if poll_row is None:
+            await interaction.response.send_message("Diese Abstimmung wurde nicht gefunden.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(LaterModal(poll_row["id"]))
 
     @discord.ui.button(label="❌ Nein", style=discord.ButtonStyle.danger, custom_id="vcr8:availability:no")
     async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1460,28 +1764,19 @@ class AvailabilityVoteView(discord.ui.View):
             return
 
         if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message(
-                "Du brauchst dafür die Rolle **Fertig**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
             return
 
         poll_row = get_poll_by_message_id(interaction.message.id)
         if poll_row is None:
-            await interaction.response.send_message(
-                "Diese Abstimmung wurde nicht gefunden.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Diese Abstimmung wurde nicht gefunden.", ephemeral=True)
             return
 
-        upsert_vote(poll_row["id"], interaction.user.id, "no")
+        upsert_vote(poll_row["id"], interaction.user.id, "no", later_time=None)
 
         await interaction.response.defer(ephemeral=True)
         await refresh_poll_message(interaction.guild, poll_row["id"], interaction.message)
-        await interaction.followup.send(
-            "Deine Stimme wurde auf **Nein** gesetzt.",
-            ephemeral=True,
-        )
+        await interaction.followup.send("Deine Stimme wurde auf **Nein** gesetzt.", ephemeral=True)
 
     @discord.ui.button(label="🗑️ Stimme entfernen", style=discord.ButtonStyle.secondary, custom_id="vcr8:availability:remove")
     async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1489,28 +1784,19 @@ class AvailabilityVoteView(discord.ui.View):
             return
 
         if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message(
-                "Du brauchst dafür die Rolle **Fertig**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
             return
 
         poll_row = get_poll_by_message_id(interaction.message.id)
         if poll_row is None:
-            await interaction.response.send_message(
-                "Diese Abstimmung wurde nicht gefunden.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Diese Abstimmung wurde nicht gefunden.", ephemeral=True)
             return
 
         delete_vote(poll_row["id"], interaction.user.id)
 
         await interaction.response.defer(ephemeral=True)
         await refresh_poll_message(interaction.guild, poll_row["id"], interaction.message)
-        await interaction.followup.send(
-            "Deine Stimme wurde entfernt. Du kannst jetzt wieder neu abstimmen.",
-            ephemeral=True,
-        )
+        await interaction.followup.send("Deine Stimme wurde entfernt. Du kannst jetzt wieder neu abstimmen.", ephemeral=True)
 
 
 intents = discord.Intents.default()
@@ -1628,9 +1914,34 @@ async def verfuegbarkeit(
         time_text=time_text,
         start_at=start_at,
         created_by=interaction.user.id,
+        auto_created=False,
     )
 
     await interaction.response.send_message("Verfügbarkeitsabfrage wurde erstellt.", ephemeral=True)
+
+
+@bot.tree.command(name="auto_verfuegbarkeit_an", description="Schaltet die automatische 12-Uhr-Abfrage ein")
+async def auto_verfuegbarkeit_an(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user):
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    set_setting("auto_availability_enabled", "1")
+    await interaction.response.send_message("Die automatische Verfügbarkeitsabfrage um **12:00 Uhr** ist jetzt **aktiviert**.", ephemeral=True)
+
+
+@bot.tree.command(name="auto_verfuegbarkeit_aus", description="Schaltet die automatische 12-Uhr-Abfrage aus")
+async def auto_verfuegbarkeit_aus(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user):
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    set_setting("auto_availability_enabled", "0")
+    await interaction.response.send_message("Die automatische Verfügbarkeitsabfrage um **12:00 Uhr** ist jetzt **deaktiviert**.", ephemeral=True)
 
 
 @bot.tree.command(name="sync_old_positions", description="Wandelt alte Positionsrollen serverweit in Haupt-/Nebenrollen um")
@@ -1747,21 +2058,23 @@ async def setup_server(interaction: discord.Interaction):
         overwrites=build_profile_channel_overwrites_normal(guild),
     )
 
-    old_availability = discord.utils.get(guild.text_channels, name=CH_AVAILABILITY)
-    if old_availability is not None:
+    availability_channel = discord.utils.get(guild.text_channels, name=CH_AVAILABILITY)
+    if availability_channel is None:
+        availability_channel = await guild.create_text_channel(
+            name=CH_AVAILABILITY,
+            category=chat_cat,
+            overwrites=build_availability_overwrites(guild),
+            reason="Vollpfosten CR8 Setup",
+        )
+    else:
         try:
-            await old_availability.delete(reason="Vollpfosten CR8 Setup: Verfügbarkeitskanal neu erstellen")
-        except discord.Forbidden:
-            pass
+            await availability_channel.edit(
+                category=chat_cat,
+                overwrites=build_availability_overwrites(guild),
+                reason="Vollpfosten CR8 Setup",
+            )
         except discord.HTTPException:
             pass
-
-    availability_channel = await guild.create_text_channel(
-        name=CH_AVAILABILITY,
-        category=chat_cat,
-        overwrites=build_availability_overwrites(guild),
-        reason="Vollpfosten CR8 Setup",
-    )
 
     await create_text_if_missing(
         guild, chat_cat, CH_GENERAL,
@@ -1825,7 +2138,7 @@ async def setup_server(interaction: discord.Interaction):
     await replace_panel_message(numbers_channel, NUMBERS_MARKER, numbers_text, NumberView(), interaction.client.user)
 
     await interaction.followup.send(
-        f"Setup fertig. Der Kanal **{availability_channel.mention}** wurde neu erstellt und die Panels wurden aktualisiert.",
+        f"Setup fertig. Der Kanal **{availability_channel.mention}** wurde aktualisiert und die Panels wurden erneuert.",
         ephemeral=True,
     )
 
