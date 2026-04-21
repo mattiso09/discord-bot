@@ -558,6 +558,14 @@ def parse_main_positions_from_nick(member: discord.Member) -> list[str]:
     return cleaned[:2]
 
 
+def parse_hhmm(time_str: str):
+    try:
+        t = datetime.strptime(time_str.strip(), "%H:%M")
+        return t.hour, t.minute
+    except ValueError:
+        return None
+
+
 def clean_name_for_availability(member: discord.Member) -> str:
     profile = get_profile(member.id)
     if profile["base_name"]:
@@ -597,14 +605,6 @@ def parse_manual_start_datetime(datum: str, uhrzeit: str):
             minute=time_part.minute,
             tzinfo=BOT_TZ,
         )
-    except ValueError:
-        return None
-
-
-def parse_hhmm(time_str: str):
-    try:
-        t = datetime.strptime(time_str.strip(), "%H:%M")
-        return t.hour, t.minute
     except ValueError:
         return None
 
@@ -680,6 +680,60 @@ def can_use_profile_system(member: discord.Member) -> bool:
 
 def get_role_by_name(guild: discord.Guild, role_name: str):
     return discord.utils.get(guild.roles, name=role_name)
+
+
+def get_existing_main_roles_from_member(member: discord.Member) -> list[str]:
+    found = []
+    for role in member.roles:
+        if role.name.startswith("Haupt-"):
+            pos = role.name.replace("Haupt-", "", 1)
+            if pos in POSITIONS and pos not in found:
+                found.append(pos)
+    return found[:2]
+
+
+def get_existing_side_roles_from_member(member: discord.Member) -> list[str]:
+    found = []
+    for role in member.roles:
+        if role.name.startswith("Neben-"):
+            pos = role.name.replace("Neben-", "", 1)
+            if pos in POSITIONS and pos not in found:
+                found.append(pos)
+    return found
+
+
+async def rebuild_profile_from_server_state(member: discord.Member):
+    profile = get_profile(member.id)
+
+    base_name = profile["base_name"] or strip_managed_nick(member.nick or member.global_name or member.name)
+    jersey = profile["jersey"]
+    main_positions = list(profile["main_positions"])
+    side_positions = list(profile["side_positions"])
+
+    if not jersey:
+        raw = member.nick or member.global_name or member.name or ""
+        match = re.match(r"^#(\d{1,2})\s*\|", raw.strip())
+        if match:
+            jersey = match.group(1)
+
+    if not main_positions:
+        main_positions = parse_main_positions_from_nick(member)
+
+    if not main_positions:
+        main_positions = get_existing_main_roles_from_member(member)
+
+    if not side_positions:
+        side_positions = get_existing_side_roles_from_member(member)
+
+    side_positions = [p for p in side_positions if p not in main_positions]
+
+    save_profile(
+        member.id,
+        base_name=base_name,
+        jersey=jersey,
+        main_positions=main_positions,
+        side_positions=side_positions,
+    )
 
 
 def build_nick(base_name: str, jersey: str | None, main_positions: list[str]) -> str:
@@ -771,24 +825,31 @@ def meets_profile_requirements(profile: dict) -> bool:
 
 
 async def sync_position_roles(member: discord.Member):
+    await rebuild_profile_from_server_state(member)
     guild = member.guild
     profile = get_profile(member.id)
 
     wanted_main = set(profile["main_positions"])
     wanted_side = set(profile["side_positions"])
 
-    current_managed_roles = []
+    current_main_roles = []
+    current_side_roles = []
     for role in member.roles:
-        if role.name.startswith("Haupt-") or role.name.startswith("Neben-"):
-            current_managed_roles.append(role)
+        if role.name.startswith("Haupt-"):
+            current_main_roles.append(role)
+        elif role.name.startswith("Neben-"):
+            current_side_roles.append(role)
+
+    safe_has_any_position_data = bool(wanted_main or wanted_side)
 
     remove_roles = []
-    for role in current_managed_roles:
-        if role.name.startswith("Haupt-"):
+    if safe_has_any_position_data:
+        for role in current_main_roles:
             pos = role.name.replace("Haupt-", "", 1)
             if pos not in wanted_main:
                 remove_roles.append(role)
-        elif role.name.startswith("Neben-"):
+
+        for role in current_side_roles:
             pos = role.name.replace("Neben-", "", 1)
             if pos not in wanted_side:
                 remove_roles.append(role)
@@ -826,6 +887,7 @@ async def update_registered_role(member: discord.Member):
     if registered_role is None:
         return
 
+    await rebuild_profile_from_server_state(member)
     profile = get_profile(member.id)
     should_have = has_role(member, ROLE_TESTER) and meets_profile_requirements(profile)
     has_registered = registered_role in member.roles
@@ -846,6 +908,7 @@ async def update_finished_role(member: discord.Member):
     if finished_role is None:
         return
 
+    await rebuild_profile_from_server_state(member)
     profile = get_profile(member.id)
     should_have = has_role(member, ROLE_TESTER) and meets_profile_requirements(profile)
     has_finished = finished_role in member.roles
@@ -862,15 +925,20 @@ async def update_finished_role(member: discord.Member):
 
 
 async def update_member_profile(member: discord.Member):
+    await rebuild_profile_from_server_state(member)
     base_name = await ensure_base_name(member)
     await sync_position_roles(member)
     await update_registered_role(member)
     await update_finished_role(member)
 
     profile = get_profile(member.id)
+    effective_main = profile["main_positions"]
+
+    if not effective_main:
+        effective_main = parse_main_positions_from_nick(member) or get_existing_main_roles_from_member(member)
 
     if can_use_profile_system(member):
-        new_nick = build_nick(base_name, profile["jersey"], profile["main_positions"])
+        new_nick = build_nick(base_name, profile["jersey"], effective_main)
     else:
         new_nick = base_name
 
@@ -1850,6 +1918,7 @@ async def on_member_join(member: discord.Member):
         return
 
     await ensure_base_name(member)
+    await rebuild_profile_from_server_state(member)
     await send_join_dm(member)
 
 
