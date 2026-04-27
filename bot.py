@@ -1333,6 +1333,8 @@ async def notify_nonvoters(guild: discord.Guild, poll_row):
     managers = [m for m in guild.members if has_role(m, ROLE_MANAGER)]
     finished_members = [m for m in guild.members if not m.bot and has_role(m, ROLE_FINISHED)]
 
+    warned_members = []
+
     for member in finished_members:
         if member.id in voted_ids:
             reset_missed_vote_count(member.id)
@@ -1340,29 +1342,39 @@ async def notify_nonvoters(guild: discord.Guild, poll_row):
 
         missed_count, last_warned_count = increase_missed_vote(member.id)
 
-        if missed_count >= 5 and last_warned_count < 5:
-            for manager in managers:
-                try:
-                    await manager.send(
-                        f"⚠️ {member.display_name} hat **5-mal nicht** bei Verfügbarkeitsabfragen abgestimmt."
-                    )
-                except discord.Forbidden:
-                    pass
-                except discord.HTTPException:
-                    pass
+        if missed_count >= 5:
+            warned_members.append(member)
 
             try:
                 await member.send(
                     "⚠️ Du hast **5-mal nicht** bei Verfügbarkeitsabfragen abgestimmt. "
-                    "Bitte stimme in Zukunft immer ab."
+                    "Bitte stimme in Zukunft immer bei Verfügbarkeitsabfragen ab."
                 )
             except discord.Forbidden:
                 pass
             except discord.HTTPException:
                 pass
 
-            mark_warned_count(member.id, 5)
+            reset_missed_vote_count(member.id)
 
+    if warned_members:
+        lines = "\n".join(
+            f"- {member.display_name}"
+            for member in warned_members
+        )
+
+        manager_message = (
+            "⚠️ Folgende Spieler haben **5-mal nicht** bei Verfügbarkeitsabfragen abgestimmt:\n\n"
+            f"{lines}"
+        )
+
+        for manager in managers:
+            try:
+                await manager.send(manager_message)
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
 
 async def cleanup_expired_poll_message(guild: discord.Guild, poll_row):
     channel = guild.get_channel(poll_row["channel_id"])
