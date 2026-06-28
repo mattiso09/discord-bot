@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import io
 import asyncio
 import sqlite3
 from pathlib import Path
@@ -11,6 +12,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
 
@@ -33,6 +35,7 @@ DEFAULT_DB_PATH = (
     else Path("vollpfosten_cr8.sqlite3")
 )
 DB_PATH = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH))
+LINEUP_TEMPLATE_DIR = Path("assets") / "lineups"
 SERVER_NAME = "Vollpfosten CR8"
 
 ROLE_MANAGER = "Manager"
@@ -1392,31 +1395,50 @@ def get_vote_available_at(vote, start_at: datetime):
 
 
 LINEUP_FORMATIONS = {
-    "4-2-3-1": [
-        ["ST"],
-        ["LF", "ZOM", "RF"],
-        ["ZDM", "ZM"],
-        ["LV", "IV", "IV", "RV"],
-        ["TW"],
-    ],
-    "3-4-3": [
-        ["LF", "ST", "RF"],
-        ["LV", "ZM", "ZDM", "RV"],
-        ["IV", "IV", "IV"],
-        ["TW"],
-    ],
-    "4-3-3 offensiv": [
-        ["LF", "ST", "RF"],
-        ["ZOM"],
-        ["ZM", "ZDM"],
-        ["LV", "IV", "IV", "RV"],
-        ["TW"],
-    ],
+    "4-3-3 offensiv": {
+        "template": "433_offensiv.png",
+        "rows": [
+            [("LF", "LW", 162, 198), ("ST", "ST", 438, 178), ("RF", "RW", 710, 198)],
+            [("ZM", "CM", 208, 394), ("ZOM", "CAM", 438, 374), ("ZM", "CM", 667, 394)],
+            [("LV", "LB", 89, 563), ("IV", "CB", 252, 588), ("IV", "CB", 622, 588), ("RV", "RB", 784, 563)],
+            [("TW", "GK", 438, 626)],
+        ],
+    },
+    "4-1-2-1-2": {
+        "template": "41212.png",
+        "rows": [
+            [("ST", "ST", 297, 182), ("ST", "ST", 595, 182)],
+            [("ZOM", "CAM", 446, 275)],
+            [("LF", "LM", 162, 306), ("RF", "RM", 729, 306)],
+            [("ZDM", "CDM", 447, 496)],
+            [("LV", "LB", 108, 496), ("IV", "CB", 270, 521), ("IV", "CB", 623, 521), ("RV", "RB", 783, 496)],
+            [("TW", "GK", 447, 644)],
+        ],
+    },
+    "3-4-3": {
+        "template": "343.png",
+        "rows": [
+            [("LF", "LW", 205, 177), ("ST", "ST", 453, 177), ("RF", "RW", 701, 177)],
+            [("LF", "LM", 88, 327), ("ZM", "CM", 304, 359), ("ZM", "CM", 599, 359), ("RF", "RM", 818, 327)],
+            [("IV", "CB", 184, 490), ("IV", "CB", 453, 490), ("IV", "CB", 722, 490)],
+            [("TW", "GK", 453, 650)],
+        ],
+    },
+    "4-2-3-1 (2)": {
+        "template": "4231_2.png",
+        "rows": [
+            [("ST", "ST", 453, 171)],
+            [("LF", "LM", 89, 326), ("ZOM", "CAM", 453, 377), ("RF", "RM", 813, 326)],
+            [("ZDM", "CDM", 261, 376), ("ZDM", "CDM", 623, 376)],
+            [("LV", "LB", 81, 555), ("IV", "CB", 296, 579), ("IV", "CB", 594, 579), ("RV", "RB", 782, 555)],
+            [("TW", "GK", 453, 649)],
+        ],
+    },
 }
 
 
-def flatten_lineup_slots(rows: list[list[str]]) -> list[str]:
-    return [slot for row in rows for slot in row]
+def flatten_lineup_slots(rows):
+    return [slot for row in rows for slot, _, _, _ in row]
 
 
 def assign_lineup_for_formation(players: list[dict], rows: list[list[str]]):
@@ -1465,12 +1487,12 @@ def assign_lineup_for_formation(players: list[dict], rows: list[list[str]]):
 
     for row in rows:
         assigned_row = []
-        for slot_pos in row:
+        for slot_pos, label, x, y in row:
             player_index = score[3][slot_index] if slot_index < len(score[3]) else None
             player = players[player_index] if player_index is not None else None
             if player is not None:
                 used_ids.add(player["member"].id)
-            assigned_row.append((slot_pos, player))
+            assigned_row.append((slot_pos, label, x, y, player))
             slot_index += 1
         assigned.append(assigned_row)
 
@@ -1478,7 +1500,44 @@ def assign_lineup_for_formation(players: list[dict], rows: list[list[str]]):
     return score, assigned, bench
 
 
-def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
+def load_lineup_font(size: int, bold: bool = False):
+    candidates = [
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def fit_lineup_font(draw: ImageDraw.ImageDraw, text: str, max_width: int, start_size: int = 24, min_size: int = 14):
+    for size in range(start_size, min_size - 1, -1):
+        font = load_lineup_font(size, bold=True)
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=2)
+        if bbox[2] - bbox[0] <= max_width:
+            return font
+    return load_lineup_font(min_size, bold=True)
+
+
+def draw_centered_text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font, fill, stroke_fill=(0, 0, 0), stroke_width: int = 2):
+    x, y = xy
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    text_width = bbox[2] - bbox[0]
+    draw.text(
+        (x - text_width / 2, y),
+        text,
+        font=font,
+        fill=fill,
+        stroke_fill=stroke_fill,
+        stroke_width=stroke_width,
+    )
+
+
+def build_lineup_image(guild: discord.Guild, poll_row, votes_rows):
     start_at = get_poll_start_at(poll_row)
     available = []
     for vote_index, vote in enumerate(votes_rows):
@@ -1511,68 +1570,58 @@ def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
     best_assigned = None
     best_bench = None
 
-    for formation_name, rows in LINEUP_FORMATIONS.items():
-        score, assigned, bench = assign_lineup_for_formation(available, rows)
+    for formation_name, config in LINEUP_FORMATIONS.items():
+        score, assigned, bench = assign_lineup_for_formation(available, config["rows"])
         if best_score is None or score[:3] > best_score[:3]:
             best_name = formation_name
             best_score = score
             best_assigned = assigned
             best_bench = bench
 
-    rendered_rows = []
     starters = []
+    bench = best_bench or []
+    config = LINEUP_FORMATIONS[best_name]
+    template_path = LINEUP_TEMPLATE_DIR / config["template"]
+
+    image = Image.open(template_path).convert("RGBA")
+    output = Image.new("RGBA", (image.width, image.height + 82), (22, 24, 28, 255))
+    output.alpha_composite(image, (0, 0))
+    draw = ImageDraw.Draw(output)
+
+    title_font = load_lineup_font(28, bold=True)
+    info_font = load_lineup_font(18, bold=True)
 
     for row in best_assigned or []:
-        labels = []
-        names = []
-        for slot_pos, player in row:
-            labels.append(slot_pos.center(17))
-            if player is None:
-                names.append("BOT".center(17))
-            else:
+        for slot_pos, label, x, y, player in row:
+            name = "BOT" if player is None else player["name"]
+            if player is not None:
                 starters.append((slot_pos, player))
-                names.append(shorten_lineup_text(player["name"]).center(17))
+            font = fit_lineup_font(draw, name, max_width=155, start_size=24, min_size=14)
+            draw_centered_text(draw, (x, y + 20), name, font, fill=(255, 255, 255))
 
-        rendered_rows.append(center_lineup_row(labels))
-        rendered_rows.append(center_lineup_row(names))
-        rendered_rows.append("")
-
-    bench = best_bench or []
-
-    formation = "\n".join(rendered_rows).rstrip()
-    embed = discord.Embed(
-        title=f"Aufstellung - {poll_row['title']} ({best_name or 'Formation'})",
-        description=f"```text\n{formation}\n```",
-        colour=discord.Colour.blue(),
-    )
-    embed.add_field(
-        name="Grundlage",
-        value=f"{poll_row['weekday_text']}, {poll_row['date_text']} | {poll_row['time_text']}",
-        inline=False,
-    )
-    embed.add_field(
-        name="Auswahl",
-        value="Formation automatisch gewählt: möglichst viele Spieler auf Hauptpositionen, frühere Verfügbarkeit vor späterer. Freie Plätze werden mit Bots aufgefüllt.",
-        inline=False,
+    footer_y = image.height + 10
+    draw.text((22, footer_y), f"{poll_row['title']} - {best_name}", font=title_font, fill=(255, 255, 255), stroke_fill=(0, 0, 0), stroke_width=2)
+    draw.text(
+        (22, footer_y + 38),
+        f"{poll_row['weekday_text']}, {poll_row['date_text']} | {poll_row['time_text']} | freie Plätze: BOT",
+        font=info_font,
+        fill=(220, 235, 220),
+        stroke_fill=(0, 0, 0),
+        stroke_width=2,
     )
 
-    if bench:
-        bench_lines = []
-        for player in sorted(bench, key=lambda p: (p["available_at"], p["vote_index"], p["name"].lower())):
-            pos_text = "/".join(player["positions"]) if player["positions"] else "?"
-            bench_lines.append(f"{pos_text} | {player['name']}")
-        embed.add_field(name="Bank", value="\n".join(bench_lines[:20]), inline=False)
-    else:
-        embed.add_field(name="Bank", value="-", inline=False)
+    buffer = io.BytesIO()
+    output.convert("RGB").save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
 
-    if not starters:
-        embed.add_field(
-            name="Hinweis",
-            value="Noch keine passenden Zusagen in der aktuellen Verfügbarkeitsabfrage.",
-            inline=False,
-        )
+    bench_lines = []
+    for player in sorted(bench, key=lambda p: (p["available_at"], p["vote_index"], p["name"].lower())):
+        pos_text = "/".join(player["positions"]) if player["positions"] else "?"
+        bench_lines.append(f"{pos_text} | {player['name']}")
 
-    return embed
+    filename = f"aufstellung_{poll_row['id']}.png"
+    file = discord.File(buffer, filename=filename)
+    return file, best_name, bench_lines
 
 
 def count_lineup_available_players(guild: discord.Guild, votes_rows) -> int:
@@ -2420,7 +2469,7 @@ async def aufstellung(interaction: discord.Interaction):
         )
         return
 
-    embed = build_lineup_embed(guild, poll_row, votes_rows)
+    file, formation_name, bench_lines = build_lineup_image(guild, poll_row, votes_rows)
 
     target_channel = discord.utils.get(guild.text_channels, name=CH_LINEUPS)
     if target_channel is None:
@@ -2430,8 +2479,14 @@ async def aufstellung(interaction: discord.Interaction):
         await interaction.response.send_message("Ich konnte keinen passenden Textkanal für die Aufstellung finden.", ephemeral=True)
         return
 
+    content = f"**Aufstellung:** {poll_row['title']} | **Formation:** {formation_name}"
+    if bench_lines:
+        content += "\n**Bank:**\n" + "\n".join(bench_lines[:12])
+    else:
+        content += "\n**Bank:** -"
+
     try:
-        await target_channel.send(embed=embed)
+        await target_channel.send(content=content, file=file)
     except discord.Forbidden:
         await interaction.response.send_message("Ich darf in den Aufstellungs-Kanal nicht schreiben.", ephemeral=True)
         return
