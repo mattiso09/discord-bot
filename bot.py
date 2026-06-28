@@ -65,6 +65,7 @@ CH_PROFILE = "profil"
 CH_MAIN_POSITIONS = "hauptpositionen"
 CH_SIDE_POSITIONS = "nebenpositionen"
 CH_NUMBERS = "trikotnummer"
+CH_CLUB_BADGE = "vereinswappen"
 CH_GENERAL = "allgemein"
 CH_CLIPS = "clips"
 CH_MANAGER = "manager-chat"
@@ -75,6 +76,7 @@ CH_AVAILABILITY = "verfuegbarkeit"
 VC_BENCH = "bank"
 VC_STAMMELF = "kabine"
 VC_MANAGER = "krisenbesprechung"
+VC_OTHER_GAMES = "andere-games"
 
 RULES_MARKER = "[VCR8_RULES_PANEL]"
 MAIN_POSITIONS_MARKER = "[VCR8_MAIN_POSITIONS_PANEL]"
@@ -1065,6 +1067,36 @@ async def create_voice_if_missing(guild: discord.Guild, category: discord.Catego
     return channel
 
 
+def get_voice_channel_by_names(guild: discord.Guild, names: list[str]):
+    lowered = {name.lower() for name in names}
+    for channel in guild.voice_channels:
+        if channel.name.lower() in lowered:
+            return channel
+    return None
+
+
+async def apply_channel_overwrites(channel, overwrites, reason: str = "Vollpfosten CR8 Setup"):
+    try:
+        await channel.edit(overwrites=overwrites, reason=reason)
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException:
+        pass
+
+
+async def delete_channel_if_exists(guild: discord.Guild, name: str):
+    channel = discord.utils.get(guild.channels, name=name)
+    if channel is None:
+        return False
+    try:
+        await channel.delete(reason="Vollpfosten CR8 Setup: alter Profilkanal entfernt")
+        return True
+    except discord.Forbidden:
+        return False
+    except discord.HTTPException:
+        return False
+
+
 def overwrite_hidden_except(guild, roles_allowed, can_send=True):
     ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
     for role in roles_allowed:
@@ -1082,6 +1114,79 @@ def overwrite_hidden_except(guild, roles_allowed, can_send=True):
     return ow
 
 
+def overwrite_locked_text_for_managers(guild, manager_role):
+    return {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=False,
+            attach_files=False,
+            embed_links=False,
+            add_reactions=False,
+            use_application_commands=False,
+        ),
+        manager_role: discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            attach_files=True,
+            embed_links=True,
+            add_reactions=True,
+            use_application_commands=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            attach_files=True,
+            embed_links=True,
+            add_reactions=True,
+            use_application_commands=True,
+        ),
+    }
+
+
+def overwrite_team_locked_text_for_managers(guild, finished_role, manager_role):
+    return {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False,
+            read_message_history=False,
+            send_messages=False,
+            attach_files=False,
+            embed_links=False,
+            add_reactions=False,
+            use_application_commands=False,
+        ),
+        finished_role: discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=False,
+            attach_files=False,
+            embed_links=False,
+            add_reactions=False,
+            use_application_commands=False,
+        ) if finished_role else discord.PermissionOverwrite(),
+        manager_role: discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            attach_files=True,
+            embed_links=True,
+            add_reactions=True,
+            use_application_commands=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            attach_files=True,
+            embed_links=True,
+            add_reactions=True,
+            use_application_commands=True,
+        ),
+    }
+
+
 def overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role):
     return {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -1089,6 +1194,66 @@ def overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role):
         manager_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, add_reactions=True),
         stammelf_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, add_reactions=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, add_reactions=True),
+    }
+
+
+def overwrite_voice_bank(guild, manager_role):
+    return {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            move_members=False,
+        ),
+        manager_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            move_members=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            move_members=True,
+        ),
+    }
+
+
+def overwrite_voice_for_finished(guild, finished_role, manager_role):
+    return {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False,
+            connect=False,
+            speak=False,
+            move_members=False,
+        ),
+        finished_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            move_members=False,
+        ) if finished_role else discord.PermissionOverwrite(),
+        manager_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            move_members=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            move_members=True,
+        ),
     }
 
 
@@ -1102,13 +1267,45 @@ def overwrite_voice_public(guild, tester_role, manager_role, stammelf_role):
     }
 
 
-def overwrite_voice_stammelf(guild, tester_role, manager_role, stammelf_role):
+def overwrite_voice_kabine(guild, finished_role, manager_role, stammelf_role):
     return {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        tester_role: discord.PermissionOverwrite(view_channel=True, connect=False, speak=False),
-        manager_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-        stammelf_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
+        finished_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            move_members=False,
+        ) if finished_role else discord.PermissionOverwrite(),
+        stammelf_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            move_members=False,
+            use_soundboard=True,
+            use_external_sounds=True,
+        ),
+        manager_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            move_members=True,
+            use_soundboard=True,
+            use_external_sounds=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            move_members=True,
+            use_soundboard=True,
+            use_external_sounds=True,
+        ),
     }
 
 
@@ -2680,7 +2877,7 @@ async def setup_server(interaction: discord.Interaction):
     stammelf_role = await create_role_if_missing(guild, ROLE_STAMMELF, discord.Colour.gold())
     tester_role = await create_role_if_missing(guild, ROLE_TESTER, discord.Colour.blue())
     await create_role_if_missing(guild, ROLE_REGISTERED, discord.Colour.green())
-    await create_role_if_missing(guild, ROLE_FINISHED, discord.Colour.purple())
+    finished_role = await create_role_if_missing(guild, ROLE_FINISHED, discord.Colour.purple())
 
     for pos in POSITIONS:
         await create_role_if_missing(guild, main_role_name(pos), discord.Colour.orange())
@@ -2695,33 +2892,41 @@ async def setup_server(interaction: discord.Interaction):
         guild,
         info_cat,
         CH_RULES,
-        overwrites=build_profile_channel_overwrites_normal(guild),
+        overwrites=overwrite_locked_text_for_managers(guild, manager_role),
     )
     profile_channel = await create_text_if_missing(
         guild,
         info_cat,
         CH_PROFILE,
-        overwrites=build_profile_channel_overwrites_normal(guild),
+        overwrites=overwrite_locked_text_for_managers(guild, manager_role),
+    )
+    club_badge_channel = await create_text_if_missing(
+        guild,
+        info_cat,
+        CH_CLUB_BADGE,
+        overwrites=overwrite_locked_text_for_managers(guild, manager_role),
     )
     for legacy_name in (CH_MAIN_POSITIONS, CH_SIDE_POSITIONS, CH_NUMBERS):
-        legacy_channel = discord.utils.get(guild.text_channels, name=legacy_name)
-        if legacy_channel is not None:
-            try:
-                await legacy_channel.edit(
-                    overwrites=build_profile_channel_overwrites_off(guild),
-                    reason="Vollpfosten CR8 Setup: Profil-Panels sind jetzt in #profil",
-                )
-            except discord.HTTPException:
-                pass
+        await delete_channel_if_exists(guild, legacy_name)
 
     availability_channel = discord.utils.get(guild.text_channels, name=CH_AVAILABILITY)
     if availability_channel is None:
         availability_channel = await guild.create_text_channel(
             name=CH_AVAILABILITY,
             category=chat_cat,
-            overwrites=build_availability_overwrites(guild),
+            overwrites=overwrite_team_locked_text_for_managers(guild, finished_role, manager_role),
             reason="Vollpfosten CR8 Setup",
         )
+    lineups_channel = await create_text_if_missing(
+        guild, chat_cat, CH_LINEUPS,
+        overwrites=overwrite_team_locked_text_for_managers(guild, finished_role, manager_role),
+    )
+
+    await apply_channel_overwrites(rules_channel, overwrite_locked_text_for_managers(guild, manager_role))
+    await apply_channel_overwrites(profile_channel, overwrite_locked_text_for_managers(guild, manager_role))
+    await apply_channel_overwrites(club_badge_channel, overwrite_locked_text_for_managers(guild, manager_role))
+    await apply_channel_overwrites(availability_channel, overwrite_team_locked_text_for_managers(guild, finished_role, manager_role))
+    await apply_channel_overwrites(lineups_channel, overwrite_team_locked_text_for_managers(guild, finished_role, manager_role))
 
     await create_text_if_missing(
         guild, chat_cat, CH_GENERAL,
@@ -2729,10 +2934,6 @@ async def setup_server(interaction: discord.Interaction):
     )
     await create_text_if_missing(
         guild, chat_cat, CH_CLIPS,
-        overwrites=overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role),
-    )
-    await create_text_if_missing(
-        guild, chat_cat, CH_LINEUPS,
         overwrites=overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role),
     )
     await create_text_if_missing(
@@ -2744,18 +2945,29 @@ async def setup_server(interaction: discord.Interaction):
         overwrites=overwrite_hidden_except(guild, [stammelf_role, manager_role], can_send=True),
     )
 
-    await create_voice_if_missing(
+    bench_voice = await create_voice_if_missing(
         guild, voice_cat, VC_BENCH,
-        overwrites=overwrite_voice_public(guild, tester_role, manager_role, stammelf_role),
+        overwrites=overwrite_voice_bank(guild, manager_role),
     )
-    await create_voice_if_missing(
+    kabine_voice = await create_voice_if_missing(
         guild, voice_cat, VC_STAMMELF,
-        overwrites=overwrite_voice_stammelf(guild, tester_role, manager_role, stammelf_role),
+        overwrites=overwrite_voice_kabine(guild, finished_role, manager_role, stammelf_role),
     )
-    await create_voice_if_missing(
+    manager_voice = await create_voice_if_missing(
         guild, voice_cat, VC_MANAGER,
         overwrites=overwrite_voice_manager(guild, manager_role),
     )
+    other_games_voice = get_voice_channel_by_names(guild, [VC_OTHER_GAMES, "andere games", "Andere Games"])
+    if other_games_voice is None:
+        other_games_voice = await create_voice_if_missing(
+            guild, voice_cat, VC_OTHER_GAMES,
+            overwrites=overwrite_voice_for_finished(guild, finished_role, manager_role),
+        )
+
+    await apply_channel_overwrites(bench_voice, overwrite_voice_bank(guild, manager_role))
+    await apply_channel_overwrites(kabine_voice, overwrite_voice_kabine(guild, finished_role, manager_role, stammelf_role))
+    await apply_channel_overwrites(manager_voice, overwrite_voice_manager(guild, manager_role))
+    await apply_channel_overwrites(other_games_voice, overwrite_voice_for_finished(guild, finished_role, manager_role))
 
     main_positions_text = (
         "## Hauptpositionen\n"
