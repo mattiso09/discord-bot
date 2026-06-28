@@ -48,6 +48,7 @@ MID_POSITIONS = {"ZM", "ZDM"}
 DEF_POSITIONS = {"IV", "RV", "LV", "TW"}
 
 PROFILE_UPDATE_SUPPRESS_SECONDS = 12
+MIN_LINEUP_PLAYERS = 4
 profile_update_suppressed_until: dict[int, datetime] = {}
 
 CATEGORY_INFO = "📌 INFO"
@@ -1527,7 +1528,7 @@ def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
         for slot_pos, player in row:
             labels.append(slot_pos.center(17))
             if player is None:
-                names.append("frei".center(17))
+                names.append("BOT".center(17))
             else:
                 starters.append((slot_pos, player))
                 names.append(shorten_lineup_text(player["name"]).center(17))
@@ -1551,7 +1552,7 @@ def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
     )
     embed.add_field(
         name="Auswahl",
-        value="Formation automatisch gewählt: möglichst viele Spieler auf Hauptpositionen, frühere Verfügbarkeit vor späterer.",
+        value="Formation automatisch gewählt: möglichst viele Spieler auf Hauptpositionen, frühere Verfügbarkeit vor späterer. Freie Plätze werden mit Bots aufgefüllt.",
         inline=False,
     )
 
@@ -1572,6 +1573,19 @@ def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
         )
 
     return embed
+
+
+def count_lineup_available_players(guild: discord.Guild, votes_rows) -> int:
+    count = 0
+    for vote in votes_rows:
+        if vote["response"] not in ("yes", "later"):
+            continue
+        member = guild.get_member(vote["user_id"])
+        if member is None:
+            continue
+        if get_main_positions_for_member(member):
+            count += 1
+    return count
 
 
 async def refresh_poll_message(guild: discord.Guild, poll_id: int, message: discord.Message | None = None):
@@ -2398,6 +2412,14 @@ async def aufstellung(interaction: discord.Interaction):
         return
 
     votes_rows = get_votes_for_poll(poll_row["id"])
+    available_count = count_lineup_available_players(guild, votes_rows)
+    if available_count < MIN_LINEUP_PLAYERS:
+        await interaction.response.send_message(
+            f"Für eine Aufstellung brauchst du mindestens **{MIN_LINEUP_PLAYERS}** verfügbare Spieler mit Hauptposition. Aktuell sind es **{available_count}**.",
+            ephemeral=True,
+        )
+        return
+
     embed = build_lineup_embed(guild, poll_row, votes_rows)
 
     target_channel = discord.utils.get(guild.text_channels, name=CH_LINEUPS)
