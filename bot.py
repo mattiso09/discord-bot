@@ -1902,6 +1902,109 @@ def build_lineup_image(guild: discord.Guild, poll_row, votes_rows):
     return file, best_name, bench_lines
 
 
+def manual_slot_key_map(formation_name: str):
+    config = LINEUP_FORMATIONS[formation_name]
+    key_map = {}
+    label_counts = {}
+    role_counts = {}
+
+    for row in config["rows"]:
+        for slot in row:
+            slot_pos, label, _, _ = slot
+            label_key = normalize_player_name(label)
+            role_key = normalize_player_name(slot_pos)
+            label_counts[label_key] = label_counts.get(label_key, 0) + 1
+            role_counts[role_key] = role_counts.get(role_key, 0) + 1
+            label_index = label_counts[label_key]
+            role_index = role_counts[role_key]
+
+            key_map[f"{label_key}{label_index}"] = slot
+            key_map[f"{role_key}{role_index}"] = slot
+            if label_index == 1:
+                key_map[label_key] = slot
+            if role_index == 1:
+                key_map[role_key] = slot
+
+    return key_map
+
+
+def parse_manual_assignments(formation_name: str, raw_text: str):
+    key_map = manual_slot_key_map(formation_name)
+    assignments = {}
+    errors = []
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = re.match(r"^([A-Za-z0-9ÄÖÜäöüß _-]+)\s*[:=\-]\s*(.+)$", line)
+        if not match:
+            errors.append(line)
+            continue
+
+        raw_key, raw_name = match.group(1).strip(), match.group(2).strip()
+        key = normalize_player_name(raw_key)
+        slot = key_map.get(key)
+        if slot is None:
+            errors.append(line)
+            continue
+
+        assignments[slot] = display_lineup_name(raw_name)
+
+    return assignments, errors
+
+
+def manual_lineup_help(formation_name: str):
+    config = LINEUP_FORMATIONS[formation_name]
+    labels = []
+    counts = {}
+    for row in config["rows"]:
+        for _, label, _, _ in row:
+            counts[label] = counts.get(label, 0) + 1
+            labels.append(f"{label}{counts[label]}" if counts[label] > 1 else label)
+    return ", ".join(labels)
+
+
+def build_manual_lineup_image(formation_name: str, title: str, assignments: dict):
+    config = LINEUP_FORMATIONS[formation_name]
+    template_path = LINEUP_TEMPLATE_DIR / config["template"]
+
+    image = Image.open(template_path).convert("RGBA")
+    output = Image.new("RGBA", (image.width, image.height + 82), (22, 24, 28, 255))
+    output.alpha_composite(image, (0, 0))
+    draw = ImageDraw.Draw(output)
+
+    title_font = load_lineup_font(28, bold=True)
+    info_font = load_lineup_font(18, bold=True)
+
+    for row in config["rows"]:
+        for slot in row:
+            _, _, x, y = slot
+            name = assignments.get(slot, "BOT")
+            if name != "BOT":
+                card_path = get_player_card_path(name)
+                if card_path is not None:
+                    paste_player_card(output, card_path, x, y)
+            draw_lineup_name_badge(draw, x, lineup_name_y(y, image.height), name, image.width)
+
+    footer_y = image.height + 10
+    draw.text((22, footer_y), f"{title} - {formation_name}", font=title_font, fill=(255, 255, 255), stroke_fill=(0, 0, 0), stroke_width=2)
+    draw.text(
+        (22, footer_y + 38),
+        "Manuelle Aufstellung | freie Plätze: BOT",
+        font=info_font,
+        fill=(220, 235, 220),
+        stroke_fill=(0, 0, 0),
+        stroke_width=2,
+    )
+
+    buffer = io.BytesIO()
+    output.convert("RGB").save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
+    return discord.File(buffer, filename="aufstellung_manuell.png")
+
+
 def count_lineup_available_players(guild: discord.Guild, votes_rows) -> int:
     count = 0
     for vote in votes_rows:
@@ -2592,6 +2695,99 @@ class AvailabilityVoteView(discord.ui.View):
         await interaction.followup.send("Deine Stimme wurde entfernt. Du kannst jetzt wieder neu abstimmen.", ephemeral=True)
 
 
+class ManualLineupModal(discord.ui.Modal):
+    def __init__(self, formation_name: str, lineup_title: str):
+        super().__init__(title="Manuelle Aufstellung")
+        self.formation_name = formation_name
+        self.lineup_title = lineup_title
+
+        self.attack = discord.ui.TextInput(
+            label="Angriff",
+            placeholder="Beispiel:\nST=Calybost\nLW=Ibri\nRW=Eviln8ghtmare",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=600,
+        )
+        self.midfield = discord.ui.TextInput(
+            label="Mittelfeld",
+            placeholder="Beispiel:\nCAM=Pat_BFG\nCM1=Chabbes\nCM2=Chrisi Kongstrong\nCDM=ZERO_PAINTER",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=800,
+        )
+        self.defense = discord.ui.TextInput(
+            label="Abwehr",
+            placeholder="Beispiel:\nLB=Andi\nCB1=A4G_Prophet\nCB2=Chabbes\nRB=ZERO_PAINTER",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=800,
+        )
+        self.goalkeeper = discord.ui.TextInput(
+            label="Torwart",
+            placeholder="Beispiel:\nGK=BOT",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=120,
+        )
+
+        self.add_item(self.attack)
+        self.add_item(self.midfield)
+        self.add_item(self.defense)
+        self.add_item(self.goalkeeper)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            return
+        if not is_manager(interaction.user):
+            await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+            return
+
+        raw_text = "\n".join(
+            [
+                self.attack.value,
+                self.midfield.value,
+                self.defense.value,
+                self.goalkeeper.value,
+            ]
+        )
+        assignments, errors = parse_manual_assignments(self.formation_name, raw_text)
+        if errors:
+            await interaction.response.send_message(
+                "Diese Zeilen konnte ich nicht zuordnen:\n"
+                + "\n".join(f"- {line}" for line in errors[:8])
+                + f"\n\nErlaubte Positionsschlüssel: {manual_lineup_help(self.formation_name)}",
+                ephemeral=True,
+            )
+            return
+
+        file = build_manual_lineup_image(self.formation_name, self.lineup_title, assignments)
+        await interaction.response.send_message(
+            content=f"**Manuelle Aufstellung:** {self.lineup_title} | **Formation:** {self.formation_name}",
+            file=file,
+        )
+
+        try:
+            await interaction.message.delete()
+        except (discord.Forbidden, discord.HTTPException, AttributeError):
+            pass
+
+
+class ManualLineupView(discord.ui.View):
+    def __init__(self, formation_name: str, lineup_title: str):
+        super().__init__(timeout=900)
+        self.formation_name = formation_name
+        self.lineup_title = lineup_title
+
+    @discord.ui.button(label="Spieler eintragen", style=discord.ButtonStyle.primary, custom_id="vcr8:manual_lineup:edit")
+    async def edit_lineup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member):
+            return
+        if not is_manager(interaction.user):
+            await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ManualLineupModal(self.formation_name, self.lineup_title))
+
+
 intents = discord.Intents.default()
 intents.members = True
 
@@ -2773,6 +2969,67 @@ async def aufstellung(interaction: discord.Interaction):
         return
 
     await interaction.response.send_message(f"Aufstellung wurde in {target_channel.mention} erstellt.", ephemeral=True)
+
+
+@app_commands.describe(
+    formation="Formation für die manuelle Aufstellung",
+    titel="Titel der Aufstellung"
+)
+@app_commands.choices(
+    formation=[
+        app_commands.Choice(name="4-3-3 offensiv", value="4-3-3 offensiv"),
+        app_commands.Choice(name="4-1-2-1-2", value="4-1-2-1-2"),
+        app_commands.Choice(name="3-4-3", value="3-4-3"),
+        app_commands.Choice(name="4-2-3-1 (2)", value="4-2-3-1 (2)"),
+    ]
+)
+@bot.tree.command(name="aufstellung_manuell", description="Erstellt eine manuell ausfüllbare Aufstellungsvorlage")
+async def aufstellung_manuell(
+    interaction: discord.Interaction,
+    formation: app_commands.Choice[str],
+    titel: str = "Manuelle Aufstellung",
+):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user):
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    target_channel = discord.utils.get(guild.text_channels, name=CH_LINEUPS)
+    if target_channel is None:
+        target_channel = interaction.channel
+
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message("Ich konnte keinen passenden Textkanal für die Aufstellung finden.", ephemeral=True)
+        return
+
+    formation_name = formation.value
+    file = build_manual_lineup_image(formation_name, titel, {})
+    help_text = manual_lineup_help(formation_name)
+    content = (
+        f"**Manuelle Aufstellung:** {titel} | **Formation:** {formation_name}\n"
+        "Drücke **Spieler eintragen** und fülle die Positionen aus.\n"
+        f"Positionsschlüssel: `{help_text}`"
+    )
+
+    try:
+        await target_channel.send(
+            content=content,
+            file=file,
+            view=ManualLineupView(formation_name, titel),
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("Ich darf in den Aufstellungs-Kanal nicht schreiben.", ephemeral=True)
+        return
+    except discord.HTTPException:
+        await interaction.response.send_message("Fehler beim Erstellen der manuellen Aufstellung.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"Manuelle Aufstellung wurde in {target_channel.mention} vorbereitet.", ephemeral=True)
 
 
 @bot.tree.command(name="auto_verfuegbarkeit_an", description="Schaltet die automatische 12-Uhr-Abfrage ein")
