@@ -395,6 +395,22 @@ def get_latest_poll_message_id_for_channel(channel_id: int):
     return row["message_id"] if row else None
 
 
+def get_latest_open_poll_for_channel(channel_id: int):
+    con = db()
+    row = con.execute(
+        """
+        SELECT *
+        FROM polls
+        WHERE channel_id = ? AND closed = 0
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (channel_id,),
+    ).fetchone()
+    con.close()
+    return row
+
+
 def upsert_vote(poll_id: int, user_id: int, response: str, later_time: str | None = None):
     con = db()
     con.execute(
@@ -1316,6 +1332,124 @@ def build_poll_embed(guild: discord.Guild, poll_row, votes_rows):
     return embed
 
 
+def get_main_positions_for_member(member: discord.Member) -> list[str]:
+    profile = get_profile(member.id)
+    positions = list(profile["main_positions"])
+    if not positions:
+        positions = parse_main_positions_from_nick(member)
+    if not positions:
+        positions = get_existing_main_roles_from_member(member)
+    return [pos for pos in positions if pos in POSITIONS][:2]
+
+
+def shorten_lineup_text(text: str, max_len: int = 17) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "."
+
+
+def center_lineup_row(cells: list[str], width: int = 76) -> str:
+    if not cells:
+        return ""
+    if len(cells) == 1:
+        return cells[0].center(width).rstrip()
+    gap = max(2, (width - sum(len(cell) for cell in cells)) // (len(cells) - 1))
+    return (" " * gap).join(cells).center(width).rstrip()
+
+
+def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
+    available = []
+    for vote in votes_rows:
+        if vote["response"] not in ("yes", "later"):
+            continue
+        member = guild.get_member(vote["user_id"])
+        if member is None:
+            continue
+        positions = get_main_positions_for_member(member)
+        name = clean_name_for_availability(member)
+        if vote["response"] == "later" and vote["later_time"]:
+            name = f"{name} ({vote['later_time']})"
+        available.append(
+            {
+                "member": member,
+                "name": name,
+                "positions": positions,
+                "voted_at": vote["voted_at"],
+            }
+        )
+
+    available.sort(key=lambda player: player["voted_at"])
+
+    assigned_ids = set()
+    slots = [
+        ["ST"],
+        ["LF", "ZOM", "RF"],
+        ["ZM", "ZDM"],
+        ["LV", "IV", "IV", "RV"],
+        ["TW"],
+    ]
+
+    rendered_rows = []
+    starters = []
+
+    for row in slots:
+        labels = []
+        names = []
+        for slot_pos in row:
+            picked = None
+            for player in available:
+                if player["member"].id in assigned_ids:
+                    continue
+                if slot_pos in player["positions"]:
+                    picked = player
+                    break
+
+            labels.append(slot_pos.center(17))
+            if picked is None:
+                names.append("frei".center(17))
+            else:
+                assigned_ids.add(picked["member"].id)
+                starters.append((slot_pos, picked))
+                names.append(shorten_lineup_text(picked["name"]).center(17))
+
+        rendered_rows.append(center_lineup_row(labels))
+        rendered_rows.append(center_lineup_row(names))
+        rendered_rows.append("")
+
+    bench = [player for player in available if player["member"].id not in assigned_ids]
+
+    formation = "\n".join(rendered_rows).rstrip()
+    embed = discord.Embed(
+        title=f"Aufstellung - {poll_row['title']}",
+        description=f"```text\n{formation}\n```",
+        colour=discord.Colour.blue(),
+    )
+    embed.add_field(
+        name="Grundlage",
+        value=f"{poll_row['weekday_text']}, {poll_row['date_text']} | {poll_row['time_text']}",
+        inline=False,
+    )
+
+    if bench:
+        bench_lines = []
+        for player in bench:
+            pos_text = "/".join(player["positions"]) if player["positions"] else "?"
+            bench_lines.append(f"{pos_text} | {player['name']}")
+        embed.add_field(name="Bank", value="\n".join(bench_lines[:20]), inline=False)
+    else:
+        embed.add_field(name="Bank", value="-", inline=False)
+
+    if not starters:
+        embed.add_field(
+            name="Hinweis",
+            value="Noch keine passenden Zusagen in der aktuellen Verfügbarkeitsabfrage.",
+            inline=False,
+        )
+
+    return embed
+
+
 async def refresh_poll_message(guild: discord.Guild, poll_id: int, message: discord.Message | None = None):
     poll_row = get_poll_by_id(poll_id)
     if poll_row is None:
@@ -2115,6 +2249,51 @@ async def verfuegbarkeit(
     )
 
     await interaction.response.send_message("Verfügbarkeitsabfrage wurde erstellt.", ephemeral=True)
+
+
+@bot.tree.command(name="aufstellung", description="Erstellt eine visuelle Aufstellung aus der neuesten Verfügbarkeitsabfrage")
+async def aufstellung(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user):
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    availability_channel = discord.utils.get(guild.text_channels, name=CH_AVAILABILITY)
+    if availability_channel is None:
+        await interaction.response.send_message("Der Kanal **verfuegbarkeit** existiert nicht.", ephemeral=True)
+        return
+
+    poll_row = get_latest_open_poll_for_channel(availability_channel.id)
+    if poll_row is None:
+        await interaction.response.send_message("Es gibt gerade keine offene Verfügbarkeitsabfrage.", ephemeral=True)
+        return
+
+    votes_rows = get_votes_for_poll(poll_row["id"])
+    embed = build_lineup_embed(guild, poll_row, votes_rows)
+
+    target_channel = discord.utils.get(guild.text_channels, name=CH_LINEUPS)
+    if target_channel is None:
+        target_channel = interaction.channel
+
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message("Ich konnte keinen passenden Textkanal für die Aufstellung finden.", ephemeral=True)
+        return
+
+    try:
+        await target_channel.send(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("Ich darf in den Aufstellungs-Kanal nicht schreiben.", ephemeral=True)
+        return
+    except discord.HTTPException:
+        await interaction.response.send_message("Fehler beim Erstellen der Aufstellung.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"Aufstellung wurde in {target_channel.mention} erstellt.", ephemeral=True)
 
 
 @bot.tree.command(name="auto_verfuegbarkeit_an", description="Schaltet die automatische 12-Uhr-Abfrage ein")
