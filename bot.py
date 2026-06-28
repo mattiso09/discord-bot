@@ -47,6 +47,9 @@ OFF_POSITIONS = {"LF", "ZOM", "RF", "ST"}
 MID_POSITIONS = {"ZM", "ZDM"}
 DEF_POSITIONS = {"IV", "RV", "LV", "TW"}
 
+PROFILE_UPDATE_SUPPRESS_SECONDS = 12
+profile_update_suppressed_until: dict[int, datetime] = {}
+
 CATEGORY_INFO = "📌 INFO"
 CATEGORY_CHAT = "💬 CHAT"
 CATEGORY_TEAM = "🧠 TEAM"
@@ -823,6 +826,20 @@ async def send_join_dm(member: discord.Member):
         pass
 
 
+def suppress_profile_rebuild(member_id: int):
+    profile_update_suppressed_until[member_id] = datetime.now(BOT_TZ) + timedelta(seconds=PROFILE_UPDATE_SUPPRESS_SECONDS)
+
+
+def is_profile_rebuild_suppressed(member_id: int) -> bool:
+    until = profile_update_suppressed_until.get(member_id)
+    if until is None:
+        return False
+    if datetime.now(BOT_TZ) >= until:
+        profile_update_suppressed_until.pop(member_id, None)
+        return False
+    return True
+
+
 async def send_private_progress_dm(member: discord.Member, intro: str):
     fresh = await get_fresh_member(member)
     text = f"{intro}\n\n{next_step_message(fresh)}"
@@ -964,6 +981,7 @@ async def update_member_profile(member: discord.Member, rebuild: bool = True):
     if rebuild:
         await rebuild_profile_from_server_state(member)
     base_name = await ensure_base_name(member)
+    suppress_profile_rebuild(member.id)
     await sync_position_roles(member, rebuild=False)
     await update_registered_role(member, rebuild=False)
     await update_finished_role(member, rebuild=False)
@@ -2052,6 +2070,8 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     if after.guild.id != GUILD_ID:
+        return
+    if is_profile_rebuild_suppressed(after.id):
         return
 
     before_roles = {r.id for r in before.roles}
