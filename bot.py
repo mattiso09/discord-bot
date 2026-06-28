@@ -1028,15 +1028,6 @@ async def create_text_if_missing(guild: discord.Guild, category: discord.Categor
             overwrites=overwrites,
             reason="Vollpfosten CR8 Setup",
         )
-    else:
-        try:
-            await channel.edit(
-                category=category,
-                overwrites=overwrites if overwrites is not None else channel.overwrites,
-                reason="Vollpfosten CR8 Setup",
-            )
-        except discord.HTTPException:
-            pass
     return channel
 
 
@@ -1050,16 +1041,6 @@ async def create_voice_if_missing(guild: discord.Guild, category: discord.Catego
             user_limit=user_limit or 0,
             reason="Vollpfosten CR8 Setup",
         )
-    else:
-        try:
-            await channel.edit(
-                category=category,
-                overwrites=overwrites if overwrites is not None else channel.overwrites,
-                user_limit=user_limit if user_limit is not None else channel.user_limit,
-                reason="Vollpfosten CR8 Setup",
-            )
-        except discord.HTTPException:
-            pass
     return channel
 
 
@@ -2280,15 +2261,6 @@ async def setup_server(interaction: discord.Interaction):
             overwrites=build_availability_overwrites(guild),
             reason="Vollpfosten CR8 Setup",
         )
-    else:
-        try:
-            await availability_channel.edit(
-                category=chat_cat,
-                overwrites=build_availability_overwrites(guild),
-                reason="Vollpfosten CR8 Setup",
-            )
-        except discord.HTTPException:
-            pass
 
     await create_text_if_missing(
         guild, chat_cat, CH_GENERAL,
