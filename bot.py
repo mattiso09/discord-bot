@@ -1405,21 +1405,21 @@ LINEUP_FORMATIONS = {
         ],
     },
     "4-1-2-1-2": {
-        "template": "41212.png",
+        "template": "41212_2.png",
         "rows": [
-            [("ST", "ST", 297, 182), ("ST", "ST", 595, 182)],
-            [("ZOM", "CAM", 446, 275)],
-            [("LF", "LM", 162, 306), ("RF", "RM", 729, 306)],
-            [("ZDM", "CDM", 447, 496)],
-            [("LV", "LB", 108, 496), ("IV", "CB", 270, 521), ("IV", "CB", 623, 521), ("RV", "RB", 783, 496)],
-            [("TW", "GK", 447, 644)],
+            [("ST", "ST", 286, 181), ("ST", "ST", 586, 181)],
+            [("ZOM", "CAM", 435, 256)],
+            [("ZM", "CM", 178, 340), ("ZM", "CM", 693, 340)],
+            [("ZDM", "CDM", 435, 449)],
+            [("LV", "LB", 96, 511), ("IV", "CB", 289, 521), ("IV", "CB", 576, 521), ("RV", "RB", 770, 511)],
+            [("TW", "GK", 435, 644)],
         ],
     },
     "3-4-3": {
         "template": "343.png",
         "rows": [
             [("LF", "LW", 205, 177), ("ST", "ST", 453, 177), ("RF", "RW", 701, 177)],
-            [("LF", "LM", 88, 327), ("ZM", "CM", 304, 359), ("ZM", "CM", 599, 359), ("RF", "RM", 818, 327)],
+            [("LV", "LM", 88, 327), ("ZM", "CM", 304, 359), ("ZM", "CM", 599, 359), ("RV", "RM", 818, 327)],
             [("IV", "CB", 184, 490), ("IV", "CB", 453, 490), ("IV", "CB", 722, 490)],
             [("TW", "GK", 453, 650)],
         ],
@@ -1514,13 +1514,19 @@ def load_lineup_font(size: int, bold: bool = False):
     return ImageFont.load_default()
 
 
-def fit_lineup_font(draw: ImageDraw.ImageDraw, text: str, max_width: int, start_size: int = 24, min_size: int = 14):
+def fit_lineup_font(draw: ImageDraw.ImageDraw, text: str, max_width: int, start_size: int = 19, min_size: int = 11):
     for size in range(start_size, min_size - 1, -1):
         font = load_lineup_font(size, bold=True)
         bbox = draw.textbbox((0, 0), text, font=font, stroke_width=2)
         if bbox[2] - bbox[0] <= max_width:
             return font
     return load_lineup_font(min_size, bold=True)
+
+
+def lineup_name_y(label_y: int, image_height: int) -> int:
+    if label_y > image_height - 55:
+        return label_y - 58
+    return label_y - 48
 
 
 def draw_centered_text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font, fill, stroke_fill=(0, 0, 0), stroke_width: int = 2):
@@ -1596,8 +1602,8 @@ def build_lineup_image(guild: discord.Guild, poll_row, votes_rows):
             name = "BOT" if player is None else player["name"]
             if player is not None:
                 starters.append((slot_pos, player))
-            font = fit_lineup_font(draw, name, max_width=155, start_size=24, min_size=14)
-            draw_centered_text(draw, (x, y + 20), name, font, fill=(255, 255, 255))
+            font = fit_lineup_font(draw, name, max_width=98, start_size=17, min_size=10)
+            draw_centered_text(draw, (x, lineup_name_y(y, image.height)), name, font, fill=(255, 255, 255))
 
     footer_y = image.height + 10
     draw.text((22, footer_y), f"{poll_row['title']} - {best_name}", font=title_font, fill=(255, 255, 255), stroke_fill=(0, 0, 0), stroke_width=2)
