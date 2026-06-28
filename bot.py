@@ -36,6 +36,7 @@ DEFAULT_DB_PATH = (
 )
 DB_PATH = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH))
 LINEUP_TEMPLATE_DIR = Path("assets") / "lineups"
+PLAYER_CARD_DIR = Path("assets") / "cards"
 SERVER_NAME = "Vollpfosten CR8"
 
 ROLE_MANAGER = "Manager"
@@ -1543,6 +1544,77 @@ def draw_centered_text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str
     )
 
 
+PLAYER_CARD_FILES = {
+    "a4gprophet": "A4G_Prophet.png",
+    "prophet": "A4G_Prophet.png",
+    "andi": "Andi.png",
+    "calybost": "Calybost.png",
+    "calypost": "Calybost.png",
+    "chabbes": "Chabbes.png",
+    "chrisi kongstrong": "Chrisi_Kongstrong.png",
+    "chrisikongstrong": "Chrisi_Kongstrong.png",
+    "eviln8ghtmare": "Eviln8ghtmare.png",
+    "ibri": "Ibri.png",
+    "ibrakadabra": "Ibri.png",
+    "ibrakadabra1900": "Ibri.png",
+    "patbfg": "Pat_BFG.png",
+    "pat bfg": "Pat_BFG.png",
+    "zeropainter": "ZERO_PAINTER.png",
+    "zero painter": "ZERO_PAINTER.png",
+}
+
+DISPLAY_NAME_ALIASES = {
+    "calypost": "Calybost",
+}
+
+
+def normalize_player_name(name: str) -> str:
+    name = re.sub(r"\([^)]*\)", "", name).lower()
+    name = re.sub(r"[^a-z0-9]+", "", name)
+    return name
+
+
+def display_lineup_name(name: str) -> str:
+    suffix_match = re.search(r"\s*(\([^)]*\))\s*$", name)
+    suffix = f" {suffix_match.group(1)}" if suffix_match else ""
+    base = re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
+    normalized = normalize_player_name(base)
+    return f"{DISPLAY_NAME_ALIASES.get(normalized, base)}{suffix}".strip()
+
+
+def get_player_card_path(name: str):
+    normalized = normalize_player_name(name)
+    filename = PLAYER_CARD_FILES.get(normalized)
+    if filename is None:
+        return None
+    path = PLAYER_CARD_DIR / filename
+    return path if path.exists() else None
+
+
+def paste_player_card(base: Image.Image, card_path: Path, x: int, label_y: int):
+    card = Image.open(card_path).convert("RGBA")
+    target_h = 142
+    target_w = round(card.width * (target_h / card.height))
+    card = card.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    left = round(x - target_w / 2)
+    top = round(label_y - target_h - 13)
+    left = max(0, min(left, base.width - target_w))
+    top = max(0, min(top, base.height - target_h))
+    base.alpha_composite(card, (left, top))
+
+
+def draw_lineup_name_badge(draw: ImageDraw.ImageDraw, x: int, y: int, name: str, image_width: int):
+    font = fit_lineup_font(draw, name, max_width=96, start_size=13, min_size=9)
+    bbox = draw.textbbox((0, 0), name, font=font, stroke_width=1)
+    width = bbox[2] - bbox[0] + 10
+    height = bbox[3] - bbox[1] + 7
+    left = max(4, min(round(x - width / 2), image_width - width - 4))
+    top = max(4, y)
+    draw.rounded_rectangle((left, top, left + width, top + height), radius=7, fill=(0, 0, 0, 185))
+    draw.text((left + 5, top + 2), name, font=font, fill=(255, 255, 255), stroke_fill=(0, 0, 0), stroke_width=1)
+
+
 def build_lineup_image(guild: discord.Guild, poll_row, votes_rows):
     start_at = get_poll_start_at(poll_row)
     available = []
@@ -1559,6 +1631,7 @@ def build_lineup_image(guild: discord.Guild, poll_row, votes_rows):
         available_at = get_vote_available_at(vote, start_at)
         if vote["response"] == "later" and vote["later_time"]:
             name = f"{name} ({vote['later_time']})"
+        name = display_lineup_name(name)
         available.append(
             {
                 "member": member,
@@ -1602,8 +1675,10 @@ def build_lineup_image(guild: discord.Guild, poll_row, votes_rows):
             name = "BOT" if player is None else player["name"]
             if player is not None:
                 starters.append((slot_pos, player))
-            font = fit_lineup_font(draw, name, max_width=98, start_size=17, min_size=10)
-            draw_centered_text(draw, (x, lineup_name_y(y, image.height)), name, font, fill=(255, 255, 255))
+                card_path = get_player_card_path(name)
+                if card_path is not None:
+                    paste_player_card(output, card_path, x, y)
+            draw_lineup_name_badge(draw, x, lineup_name_y(y, image.height), name, image.width)
 
     footer_y = image.height + 10
     draw.text((22, footer_y), f"{poll_row['title']} - {best_name}", font=title_font, fill=(255, 255, 255), stroke_fill=(0, 0, 0), stroke_width=2)
