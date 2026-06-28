@@ -1358,16 +1358,139 @@ def center_lineup_row(cells: list[str], width: int = 76) -> str:
     return (" " * gap).join(cells).center(width).rstrip()
 
 
+def get_poll_start_at(poll_row):
+    try:
+        start_at = datetime.fromisoformat(poll_row["start_at"])
+        if start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=BOT_TZ)
+        return start_at
+    except ValueError:
+        return datetime.now(BOT_TZ)
+
+
+def get_vote_available_at(vote, start_at: datetime):
+    if vote["response"] != "later" or not vote["later_time"]:
+        return start_at
+
+    parsed = parse_hhmm(vote["later_time"])
+    if parsed is None:
+        return start_at
+
+    hour, minute = parsed
+    available_at = datetime(
+        year=start_at.year,
+        month=start_at.month,
+        day=start_at.day,
+        hour=hour,
+        minute=minute,
+        tzinfo=BOT_TZ,
+    )
+    if available_at < start_at:
+        return start_at
+    return available_at
+
+
+LINEUP_FORMATIONS = {
+    "4-2-3-1": [
+        ["ST"],
+        ["LF", "ZOM", "RF"],
+        ["ZDM", "ZM"],
+        ["LV", "IV", "IV", "RV"],
+        ["TW"],
+    ],
+    "3-4-3": [
+        ["LF", "ST", "RF"],
+        ["LV", "ZM", "ZDM", "RV"],
+        ["IV", "IV", "IV"],
+        ["TW"],
+    ],
+    "4-3-3 offensiv": [
+        ["LF", "ST", "RF"],
+        ["ZOM"],
+        ["ZM", "ZDM"],
+        ["LV", "IV", "IV", "RV"],
+        ["TW"],
+    ],
+}
+
+
+def flatten_lineup_slots(rows: list[list[str]]) -> list[str]:
+    return [slot for row in rows for slot in row]
+
+
+def assign_lineup_for_formation(players: list[dict], rows: list[list[str]]):
+    slots = flatten_lineup_slots(rows)
+    memo = {}
+
+    def better(candidate, current):
+        if current is None:
+            return candidate
+        return candidate if candidate[:3] > current[:3] else current
+
+    def solve(slot_index: int, used_mask: int):
+        key = (slot_index, used_mask)
+        if key in memo:
+            return memo[key]
+
+        if slot_index >= len(slots):
+            return (0, 0, 0, ())
+
+        slot_pos = slots[slot_index]
+        best = solve(slot_index + 1, used_mask)
+        best = (best[0], best[1], best[2], (None,) + best[3])
+
+        for player_index, player in enumerate(players):
+            if used_mask & (1 << player_index):
+                continue
+            if slot_pos not in player["positions"]:
+                continue
+
+            rest = solve(slot_index + 1, used_mask | (1 << player_index))
+            candidate = (
+                rest[0] + 1,
+                rest[1] - int(player["available_at"].timestamp()),
+                rest[2] - player["vote_index"],
+                (player_index,) + rest[3],
+            )
+            best = better(candidate, best)
+
+        memo[key] = best
+        return best
+
+    score = solve(0, 0)
+    assigned = []
+    used_ids = set()
+    slot_index = 0
+
+    for row in rows:
+        assigned_row = []
+        for slot_pos in row:
+            player_index = score[3][slot_index] if slot_index < len(score[3]) else None
+            player = players[player_index] if player_index is not None else None
+            if player is not None:
+                used_ids.add(player["member"].id)
+            assigned_row.append((slot_pos, player))
+            slot_index += 1
+        assigned.append(assigned_row)
+
+    bench = [player for player in players if player["member"].id not in used_ids]
+    return score, assigned, bench
+
+
 def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
+    start_at = get_poll_start_at(poll_row)
     available = []
-    for vote in votes_rows:
+    for vote_index, vote in enumerate(votes_rows):
         if vote["response"] not in ("yes", "later"):
             continue
         member = guild.get_member(vote["user_id"])
         if member is None:
             continue
         positions = get_main_positions_for_member(member)
+        if not positions:
+            continue
         name = clean_name_for_availability(member)
+        available_at = get_vote_available_at(vote, start_at)
         if vote["response"] == "later" and vote["later_time"]:
             name = f"{name} ({vote['later_time']})"
         available.append(
@@ -1375,53 +1498,49 @@ def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
                 "member": member,
                 "name": name,
                 "positions": positions,
-                "voted_at": vote["voted_at"],
+                "available_at": available_at,
+                "vote_index": vote_index,
             }
         )
 
-    available.sort(key=lambda player: player["voted_at"])
+    available.sort(key=lambda player: (player["available_at"], player["vote_index"], player["name"].lower()))
 
-    assigned_ids = set()
-    slots = [
-        ["ST"],
-        ["LF", "ZOM", "RF"],
-        ["ZM", "ZDM"],
-        ["LV", "IV", "IV", "RV"],
-        ["TW"],
-    ]
+    best_name = None
+    best_score = None
+    best_assigned = None
+    best_bench = None
+
+    for formation_name, rows in LINEUP_FORMATIONS.items():
+        score, assigned, bench = assign_lineup_for_formation(available, rows)
+        if best_score is None or score[:3] > best_score[:3]:
+            best_name = formation_name
+            best_score = score
+            best_assigned = assigned
+            best_bench = bench
 
     rendered_rows = []
     starters = []
 
-    for row in slots:
+    for row in best_assigned or []:
         labels = []
         names = []
-        for slot_pos in row:
-            picked = None
-            for player in available:
-                if player["member"].id in assigned_ids:
-                    continue
-                if slot_pos in player["positions"]:
-                    picked = player
-                    break
-
+        for slot_pos, player in row:
             labels.append(slot_pos.center(17))
-            if picked is None:
+            if player is None:
                 names.append("frei".center(17))
             else:
-                assigned_ids.add(picked["member"].id)
-                starters.append((slot_pos, picked))
-                names.append(shorten_lineup_text(picked["name"]).center(17))
+                starters.append((slot_pos, player))
+                names.append(shorten_lineup_text(player["name"]).center(17))
 
         rendered_rows.append(center_lineup_row(labels))
         rendered_rows.append(center_lineup_row(names))
         rendered_rows.append("")
 
-    bench = [player for player in available if player["member"].id not in assigned_ids]
+    bench = best_bench or []
 
     formation = "\n".join(rendered_rows).rstrip()
     embed = discord.Embed(
-        title=f"Aufstellung - {poll_row['title']}",
+        title=f"Aufstellung - {poll_row['title']} ({best_name or 'Formation'})",
         description=f"```text\n{formation}\n```",
         colour=discord.Colour.blue(),
     )
@@ -1430,10 +1549,15 @@ def build_lineup_embed(guild: discord.Guild, poll_row, votes_rows):
         value=f"{poll_row['weekday_text']}, {poll_row['date_text']} | {poll_row['time_text']}",
         inline=False,
     )
+    embed.add_field(
+        name="Auswahl",
+        value="Formation automatisch gewählt: möglichst viele Spieler auf Hauptpositionen, frühere Verfügbarkeit vor späterer.",
+        inline=False,
+    )
 
     if bench:
         bench_lines = []
-        for player in bench:
+        for player in sorted(bench, key=lambda p: (p["available_at"], p["vote_index"], p["name"].lower())):
             pos_text = "/".join(player["positions"]) if player["positions"] else "?"
             bench_lines.append(f"{pos_text} | {player['name']}")
         embed.add_field(name="Bank", value="\n".join(bench_lines[:20]), inline=False)
