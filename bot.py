@@ -47,8 +47,6 @@ SERVER_NAME = "Vollpfosten CR8"
 ROLE_MANAGER = "Manager"
 ROLE_STAMMELF = "Stammelf"
 ROLE_TESTER = "Tester"
-ROLE_REGISTERED = "Registriert"
-ROLE_FINISHED = "Fertig"
 
 POSITIONS = ["TW", "IV", "RV", "LV", "ZDM", "ZM", "ZOM", "LF", "RF", "ST"]
 
@@ -79,11 +77,6 @@ CH_LINEUPS = "aufstellungen"
 CH_AVAILABILITY = "verfuegbarkeit"
 CH_MATCH_REPORTS = "spielberichte"
 
-VC_BENCH = "bank"
-VC_STAMMELF = "kabine"
-VC_MANAGER = "krisenbesprechung"
-VC_OTHER_GAMES = "andere-games"
-
 RULES_MARKER = "[VCR8_RULES_PANEL]"
 MAIN_POSITIONS_MARKER = "[VCR8_MAIN_POSITIONS_PANEL]"
 SIDE_POSITIONS_MARKER = "[VCR8_SIDE_POSITIONS_PANEL]"
@@ -94,7 +87,7 @@ RULES_TEXT = """## Willkommen bei Vollpfosten CR8
 So bist du in unter 1 Minute startklar:
 
 **1. Regeln akzeptieren**
-Drücke unten auf den Button. Danach bekommst du die Rolle **Tester**.
+Drücke unten auf den Button. Danach kannst du dein Profil ausfüllen.
 
 **2. Profil ausfüllen**
 Gehe in **#profil** und wähle:
@@ -103,7 +96,7 @@ Gehe in **#profil** und wähle:
 - optional Nebenpositionen
 
 **3. Mitspielen**
-Wenn alles fertig ist, bekommst du automatisch Zugriff auf die wichtigen Kanäle und Voice-Chats.
+Wenn Regeln, Hauptposition und Trikotnummer fertig sind, bekommst du automatisch die Rolle **Tester**.
 
 **Kurzregeln**
 - Respektvoll bleiben, kein Spam, kein unnötiges Drama.
@@ -153,7 +146,8 @@ def init_db():
             base_name TEXT,
             jersey TEXT,
             main_positions TEXT,
-            side_positions TEXT
+            side_positions TEXT,
+            rules_accepted INTEGER DEFAULT 0
         )
         """
     )
@@ -174,7 +168,6 @@ def init_db():
             auto_created INTEGER DEFAULT 0,
             yes_threshold_announced INTEGER DEFAULT 0,
             remind_60_sent INTEGER DEFAULT 0,
-            remind_5_sent INTEGER DEFAULT 0,
             closed INTEGER DEFAULT 0,
             cleanup_deleted INTEGER DEFAULT 0
         )
@@ -199,16 +192,6 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        )
-        """
-    )
-
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS nonvote_warnings (
-            user_id INTEGER PRIMARY KEY,
-            missed_count INTEGER DEFAULT 0,
-            last_warned_at_count INTEGER DEFAULT 0
         )
         """
     )
@@ -243,6 +226,8 @@ def migrate_db():
         con.execute("ALTER TABLE profiles ADD COLUMN main_positions TEXT")
     if "side_positions" not in cols_profiles:
         con.execute("ALTER TABLE profiles ADD COLUMN side_positions TEXT")
+    if "rules_accepted" not in cols_profiles:
+        con.execute("ALTER TABLE profiles ADD COLUMN rules_accepted INTEGER DEFAULT 0")
 
     cols_polls = [row["name"] for row in con.execute("PRAGMA table_info(polls)").fetchall()]
     if "auto_created" not in cols_polls:
@@ -251,8 +236,6 @@ def migrate_db():
         con.execute("ALTER TABLE polls ADD COLUMN yes_threshold_announced INTEGER DEFAULT 0")
     if "remind_60_sent" not in cols_polls:
         con.execute("ALTER TABLE polls ADD COLUMN remind_60_sent INTEGER DEFAULT 0")
-    if "remind_5_sent" not in cols_polls:
-        con.execute("ALTER TABLE polls ADD COLUMN remind_5_sent INTEGER DEFAULT 0")
     if "closed" not in cols_polls:
         con.execute("ALTER TABLE polls ADD COLUMN closed INTEGER DEFAULT 0")
     if "cleanup_deleted" not in cols_polls:
@@ -281,6 +264,7 @@ def get_profile(user_id: int):
             "jersey": None,
             "main_positions": [],
             "side_positions": [],
+            "rules_accepted": False,
         }
 
     return {
@@ -289,6 +273,7 @@ def get_profile(user_id: int):
         "jersey": row["jersey"],
         "main_positions": json.loads(row["main_positions"]) if row["main_positions"] else [],
         "side_positions": json.loads(row["side_positions"]) if row["side_positions"] else [],
+        "rules_accepted": bool(row["rules_accepted"]) if "rules_accepted" in row.keys() else False,
     }
 
 
@@ -308,7 +293,7 @@ def get_profile_by_jersey(jersey: str, exclude_user_id: int | None = None):
     return row
 
 
-def save_profile(user_id: int, base_name=None, jersey=None, main_positions=None, side_positions=None):
+def save_profile(user_id: int, base_name=None, jersey=None, main_positions=None, side_positions=None, rules_accepted=None):
     current = get_profile(user_id)
 
     if base_name is None:
@@ -319,17 +304,20 @@ def save_profile(user_id: int, base_name=None, jersey=None, main_positions=None,
         main_positions = current["main_positions"]
     if side_positions is None:
         side_positions = current["side_positions"]
+    if rules_accepted is None:
+        rules_accepted = current["rules_accepted"]
 
     con = db()
     con.execute(
         """
-        INSERT INTO profiles (user_id, base_name, jersey, main_positions, side_positions)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO profiles (user_id, base_name, jersey, main_positions, side_positions, rules_accepted)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             base_name = excluded.base_name,
             jersey = excluded.jersey,
             main_positions = excluded.main_positions,
-            side_positions = excluded.side_positions
+            side_positions = excluded.side_positions,
+            rules_accepted = excluded.rules_accepted
         """,
         (
             user_id,
@@ -337,6 +325,7 @@ def save_profile(user_id: int, base_name=None, jersey=None, main_positions=None,
             jersey,
             json.dumps(main_positions),
             json.dumps(side_positions),
+            1 if rules_accepted else 0,
         ),
     )
     con.commit()
@@ -487,13 +476,6 @@ def mark_poll_threshold_announced(poll_id: int):
 def mark_poll_reminder_60(poll_id: int):
     con = db()
     con.execute("UPDATE polls SET remind_60_sent = 1 WHERE id = ?", (poll_id,))
-    con.commit()
-    con.close()
-
-
-def mark_poll_reminder_5(poll_id: int):
-    con = db()
-    con.execute("UPDATE polls SET remind_5_sent = 1 WHERE id = ?", (poll_id,))
     con.commit()
     con.close()
 
@@ -821,8 +803,7 @@ def build_match_report_embed(match: dict, club_id: str, match_type: str) -> disc
             f"Passgenauigkeit: **{percent(totals['passes'], totals['pass_attempts'])}** "
             f"({totals['passes']}/{totals['pass_attempts']})\n"
             f"Tackles: **{totals['tackles']}/{totals['tackle_attempts']}**\n"
-            f"Paraden: **{totals['saves']}** | Rote Karten: **{totals['redcards']}**\n"
-            "xG: **nicht von EA geliefert**"
+            f"Paraden: **{totals['saves']}** | Rote Karten: **{totals['redcards']}**"
         ),
         inline=False,
     )
@@ -863,8 +844,7 @@ def build_player_stats_embed(match: dict, club_id: str, player_id: str) -> disco
         value=(
             f"Tore: **{int_stat(player, 'goals')}**\n"
             f"Assists: **{int_stat(player, 'assists')}**\n"
-            f"Schüsse: **{int_stat(player, 'shots')}**\n"
-            "xG: **nicht von EA geliefert**"
+            f"Schüsse: **{int_stat(player, 'shots')}**"
         ),
         inline=True,
     )
@@ -970,70 +950,6 @@ def get_latest_posted_ea_match():
     data = dict(row)
     data["snapshot"] = json.loads(data["snapshot_json"])
     return data
-
-
-def get_warning_info(user_id: int):
-    con = db()
-    row = con.execute(
-        "SELECT * FROM nonvote_warnings WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
-    con.close()
-    if row is None:
-        return {"user_id": user_id, "missed_count": 0, "last_warned_at_count": 0}
-    return dict(row)
-
-
-def increase_missed_vote(user_id: int):
-    info = get_warning_info(user_id)
-    new_count = info["missed_count"] + 1
-
-    con = db()
-    con.execute(
-        """
-        INSERT INTO nonvote_warnings (user_id, missed_count, last_warned_at_count)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET missed_count = excluded.missed_count
-        """,
-        (user_id, new_count, info["last_warned_at_count"]),
-    )
-    con.commit()
-    con.close()
-    return new_count, info["last_warned_at_count"]
-
-
-def mark_warned_count(user_id: int, count: int):
-    info = get_warning_info(user_id)
-    con = db()
-    con.execute(
-        """
-        INSERT INTO nonvote_warnings (user_id, missed_count, last_warned_at_count)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            missed_count = excluded.missed_count,
-            last_warned_at_count = excluded.last_warned_at_count
-        """,
-        (user_id, info["missed_count"], count),
-    )
-    con.commit()
-    con.close()
-
-
-def reset_missed_vote_count(user_id: int):
-    info = get_warning_info(user_id)
-    con = db()
-    con.execute(
-        """
-        INSERT INTO nonvote_warnings (user_id, missed_count, last_warned_at_count)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            missed_count = excluded.missed_count,
-            last_warned_at_count = excluded.last_warned_at_count
-        """,
-        (user_id, 0, info["last_warned_at_count"]),
-    )
-    con.commit()
-    con.close()
 
 
 def strip_managed_nick(name: str) -> str:
@@ -1178,13 +1094,8 @@ async def get_fresh_member(member: discord.Member) -> discord.Member:
 
 
 def can_use_profile_system(member: discord.Member) -> bool:
-    return (
-        has_role(member, ROLE_TESTER)
-        or has_role(member, ROLE_MANAGER)
-        or has_role(member, ROLE_STAMMELF)
-        or has_role(member, ROLE_REGISTERED)
-        or has_role(member, ROLE_FINISHED)
-    )
+    profile = get_profile(member.id)
+    return profile["rules_accepted"] or has_role(member, ROLE_TESTER) or has_role(member, ROLE_MANAGER) or has_role(member, ROLE_STAMMELF)
 
 
 def get_role_by_name(guild: discord.Guild, role_name: str):
@@ -1273,32 +1184,13 @@ def build_nick(base_name: str, jersey: str | None, main_positions: list[str]) ->
 def next_step_message(member: discord.Member):
     profile = get_profile(member.id)
 
-    if not has_role(member, ROLE_TESTER):
+    if not profile["rules_accepted"]:
         return "Nächster Schritt: Öffne **#regeln** und klicke auf **Regeln akzeptieren**."
     if not (1 <= len(profile["main_positions"]) <= 2):
         return "Nächster Schritt: Öffne **#profil** und wähle **1-2 Hauptpositionen**."
     if not profile["jersey"]:
         return "Nächster Schritt: Setze in **#profil** deine **freie Trikotnummer**."
-    return "✅ Fertig. Du bist registriert und kannst mitspielen."
-
-
-async def send_join_dm(member: discord.Member):
-    fresh = await get_fresh_member(member)
-    text = (
-        f"Willkommen auf **{fresh.guild.name}**.\n\n"
-        "**Dein Start in 3 Schritten:**\n"
-        "1. **#regeln** öffnen und Regeln akzeptieren.\n"
-        "2. **#profil** öffnen, Hauptpositionen wählen und Trikotnummer setzen.\n"
-        "3. Optional Nebenpositionen wählen. Wenn du keine hast, einfach überspringen.\n\n"
-        "Der Bot setzt Rollen, Nickname und Zugriff automatisch.\n\n"
-        f"{next_step_message(fresh)}"
-    )
-    try:
-        await fresh.send(text)
-    except discord.Forbidden:
-        pass
-    except discord.HTTPException:
-        pass
+    return "✅ Alles erledigt. Du hast die Rolle **Tester** und kannst mitspielen."
 
 
 def suppress_profile_rebuild(member_id: int):
@@ -1315,17 +1207,6 @@ def is_profile_rebuild_suppressed(member_id: int) -> bool:
     return True
 
 
-async def send_private_progress_dm(member: discord.Member, intro: str):
-    fresh = await get_fresh_member(member)
-    text = f"{intro}\n\n{next_step_message(fresh)}"
-    try:
-        await fresh.send(text)
-    except discord.Forbidden:
-        pass
-    except discord.HTTPException:
-        pass
-
-
 async def ensure_base_name(member: discord.Member):
     profile = get_profile(member.id)
     if profile["base_name"]:
@@ -1339,7 +1220,8 @@ async def ensure_base_name(member: discord.Member):
 
 def meets_profile_requirements(profile: dict) -> bool:
     return (
-        bool(profile["jersey"])
+        bool(profile["rules_accepted"])
+        and bool(profile["jersey"])
         and 1 <= len(profile["main_positions"]) <= 2
     )
 
@@ -1408,44 +1290,32 @@ async def remove_old_plain_position_roles(member: discord.Member):
             pass
 
 
-async def update_registered_role(member: discord.Member, rebuild: bool = True):
-    registered_role = get_role_by_name(member.guild, ROLE_REGISTERED)
-    if registered_role is None:
+async def update_tester_role(member: discord.Member, rebuild: bool = True):
+    tester_role = get_role_by_name(member.guild, ROLE_TESTER)
+    if tester_role is None:
         return
 
     if rebuild:
         await rebuild_profile_from_server_state(member)
     profile = get_profile(member.id)
-    should_have = has_role(member, ROLE_TESTER) and meets_profile_requirements(profile)
-    has_registered = registered_role in member.roles
+    has_tester = tester_role in member.roles
+    if has_tester and not profile["rules_accepted"]:
+        save_profile(
+            member.id,
+            base_name=profile["base_name"],
+            jersey=profile["jersey"],
+            main_positions=profile["main_positions"],
+            side_positions=profile["side_positions"],
+            rules_accepted=True,
+        )
+        profile = get_profile(member.id)
+    should_have = meets_profile_requirements(profile)
 
     try:
-        if should_have and not has_registered:
-            await member.add_roles(registered_role, reason="Tester und Profil vollständig")
-        elif not should_have and has_registered:
-            await member.remove_roles(registered_role, reason="Tester oder Profil unvollständig")
-    except discord.Forbidden:
-        pass
-    except discord.HTTPException:
-        pass
-
-
-async def update_finished_role(member: discord.Member, rebuild: bool = True):
-    finished_role = get_role_by_name(member.guild, ROLE_FINISHED)
-    if finished_role is None:
-        return
-
-    if rebuild:
-        await rebuild_profile_from_server_state(member)
-    profile = get_profile(member.id)
-    should_have = has_role(member, ROLE_TESTER) and meets_profile_requirements(profile)
-    has_finished = finished_role in member.roles
-
-    try:
-        if should_have and not has_finished:
-            await member.add_roles(finished_role, reason="Tester und Profil vollständig")
-        elif not should_have and has_finished:
-            await member.remove_roles(finished_role, reason="Tester oder Profil unvollständig")
+        if should_have and not has_tester:
+            await member.add_roles(tester_role, reason="Regeln und Profil vollständig")
+        elif not should_have and has_tester and not is_manager(member) and not has_role(member, ROLE_STAMMELF):
+            await member.remove_roles(tester_role, reason="Regeln oder Profil unvollständig")
     except discord.Forbidden:
         pass
     except discord.HTTPException:
@@ -1458,8 +1328,7 @@ async def update_member_profile(member: discord.Member, rebuild: bool = True):
     base_name = await ensure_base_name(member)
     suppress_profile_rebuild(member.id)
     await sync_position_roles(member, rebuild=False)
-    await update_registered_role(member, rebuild=False)
-    await update_finished_role(member, rebuild=False)
+    await update_tester_role(member, rebuild=False)
 
     profile = get_profile(member.id)
     effective_main = profile["main_positions"]
@@ -1504,27 +1373,6 @@ async def create_text_if_missing(guild: discord.Guild, category: discord.Categor
             reason="Vollpfosten CR8 Setup",
         )
     return channel
-
-
-async def create_voice_if_missing(guild: discord.Guild, category: discord.CategoryChannel, name: str, overwrites=None, user_limit=None):
-    channel = discord.utils.get(guild.voice_channels, name=name)
-    if channel is None:
-        channel = await guild.create_voice_channel(
-            name=name,
-            category=category,
-            overwrites=overwrites,
-            user_limit=user_limit or 0,
-            reason="Vollpfosten CR8 Setup",
-        )
-    return channel
-
-
-def get_voice_channel_by_names(guild: discord.Guild, names: list[str]):
-    lowered = {name.lower() for name in names}
-    for channel in guild.voice_channels:
-        if channel.name.lower() in lowered:
-            return channel
-    return None
 
 
 async def apply_channel_overwrites(channel, overwrites, reason: str = "Vollpfosten CR8 Setup"):
@@ -1649,126 +1497,6 @@ def overwrite_public_for_team(guild, tester_role, manager_role, stammelf_role):
     }
 
 
-def overwrite_voice_bank(guild, manager_role):
-    return {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            move_members=False,
-        ),
-        manager_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            move_members=True,
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            move_members=True,
-        ),
-    }
-
-
-def overwrite_voice_for_finished(guild, finished_role, manager_role):
-    return {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=False,
-            connect=False,
-            speak=False,
-            move_members=False,
-        ),
-        finished_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            move_members=False,
-        ) if finished_role else discord.PermissionOverwrite(),
-        manager_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            move_members=True,
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            move_members=True,
-        ),
-    }
-
-
-def overwrite_voice_public(guild, tester_role, manager_role, stammelf_role):
-    return {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        tester_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-        manager_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-        stammelf_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-    }
-
-
-def overwrite_voice_kabine(guild, finished_role, manager_role, stammelf_role):
-    return {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        finished_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            move_members=False,
-        ) if finished_role else discord.PermissionOverwrite(),
-        stammelf_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            move_members=False,
-            use_soundboard=True,
-            use_external_sounds=True,
-        ),
-        manager_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            move_members=True,
-            use_soundboard=True,
-            use_external_sounds=True,
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            move_members=True,
-            use_soundboard=True,
-            use_external_sounds=True,
-        ),
-    }
-
-
-def overwrite_voice_manager(guild, manager_role):
-    return {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        manager_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-    }
-
-
 def build_profile_channel_overwrites_normal(guild: discord.Guild):
     return {
         guild.default_role: discord.PermissionOverwrite(
@@ -1800,7 +1528,7 @@ def build_profile_channel_overwrites_off(guild: discord.Guild):
 
 
 def build_availability_overwrites(guild: discord.Guild):
-    fertig_role = get_role_by_name(guild, ROLE_FINISHED)
+    tester_role = get_role_by_name(guild, ROLE_TESTER)
     return {
         guild.default_role: discord.PermissionOverwrite(
             view_channel=False,
@@ -1808,12 +1536,12 @@ def build_availability_overwrites(guild: discord.Guild):
             read_message_history=False,
             add_reactions=False,
         ),
-        fertig_role: discord.PermissionOverwrite(
+        tester_role: discord.PermissionOverwrite(
             view_channel=True,
             send_messages=False,
             read_message_history=True,
             add_reactions=False,
-        ) if fertig_role else discord.PermissionOverwrite(),
+        ) if tester_role else discord.PermissionOverwrite(),
         guild.me: discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
@@ -2538,56 +2266,6 @@ async def maybe_send_threshold_message(guild: discord.Guild, poll_row):
             pass
 
 
-async def notify_nonvoters(guild: discord.Guild, poll_row):
-    votes = get_votes_for_poll(poll_row["id"])
-    voted_ids = {row["user_id"] for row in votes}
-
-    managers = [m for m in guild.members if has_role(m, ROLE_MANAGER)]
-    finished_members = [m for m in guild.members if not m.bot and has_role(m, ROLE_FINISHED)]
-
-    warned_members = []
-
-    for member in finished_members:
-        if member.id in voted_ids:
-            reset_missed_vote_count(member.id)
-            continue
-
-        missed_count, last_warned_count = increase_missed_vote(member.id)
-
-        if missed_count >= 5:
-            warned_members.append(member)
-
-            try:
-                await member.send(
-                    "⚠️ Du hast **5-mal nicht** bei Verfügbarkeitsabfragen abgestimmt. "
-                    "Bitte stimme in Zukunft immer bei Verfügbarkeitsabfragen ab."
-                )
-            except discord.Forbidden:
-                pass
-            except discord.HTTPException:
-                pass
-
-            reset_missed_vote_count(member.id)
-
-    if warned_members:
-        lines = "\n".join(
-            f"- {member.display_name}"
-            for member in warned_members
-        )
-
-        manager_message = (
-            "⚠️ Folgende Spieler haben **5-mal nicht** bei Verfügbarkeitsabfragen abgestimmt:\n\n"
-            f"{lines}"
-        )
-
-        for manager in managers:
-            try:
-                await manager.send(manager_message)
-            except discord.Forbidden:
-                pass
-            except discord.HTTPException:
-                pass
-
 async def cleanup_expired_poll_message(guild: discord.Guild, poll_row, *, force: bool = False) -> bool:
     channel = guild.get_channel(poll_row["channel_id"])
     if channel is None or not isinstance(channel, discord.TextChannel):
@@ -2707,16 +2385,7 @@ async def process_poll_reminders():
             )
             mark_poll_reminder_60(poll_row["id"])
 
-        if not poll_row["remind_5_sent"] and timedelta(minutes=0) < diff <= timedelta(minutes=5):
-            await send_yes_voter_reminder_dm(
-                guild,
-                poll_row,
-                f"🚨 **{poll_row['title']}** geht in ungefähr **5 Minuten** los.\n{POLL_NOTE}",
-            )
-            mark_poll_reminder_5(poll_row["id"])
-
         if diff <= timedelta(minutes=0):
-            await notify_nonvoters(guild, poll_row)
             close_poll(poll_row["id"])
 
     for poll_row in get_polls_pending_cleanup():
@@ -2831,30 +2500,24 @@ class RulesView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        tester_role = get_role_by_name(interaction.guild, ROLE_TESTER)
-        if tester_role is None:
-            await interaction.response.send_message("Die Rolle **Tester** existiert nicht.", ephemeral=True)
-            return
-
-        if tester_role not in interaction.user.roles:
-            try:
-                await interaction.user.add_roles(tester_role, reason="Regeln akzeptiert")
-            except discord.Forbidden:
-                await interaction.response.send_message("Ich darf die Rolle **Tester** nicht vergeben.", ephemeral=True)
-                return
-            except discord.HTTPException:
-                await interaction.response.send_message("Fehler beim Vergeben der Rolle **Tester**.", ephemeral=True)
-                return
+        profile = get_profile(interaction.user.id)
+        save_profile(
+            interaction.user.id,
+            base_name=profile["base_name"],
+            jersey=profile["jersey"],
+            main_positions=profile["main_positions"],
+            side_positions=profile["side_positions"],
+            rules_accepted=True,
+        )
 
         fresh_member = await get_fresh_member(interaction.user)
-        await update_member_profile(fresh_member)
+        await update_member_profile(fresh_member, rebuild=False)
         fresh_member = await get_fresh_member(fresh_member)
 
         await interaction.response.send_message(
             f"Regeln akzeptiert.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(fresh_member, "Du hast die Regeln akzeptiert.")
 
 
 class MainPositionSelect(discord.ui.Select):
@@ -2895,7 +2558,6 @@ class MainPositionSelect(discord.ui.Select):
             f"Deine Hauptpositionen wurden gesetzt: **{', '.join(selected)}**\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(fresh_member, "Deine Hauptpositionen wurden gespeichert.")
 
 
 class MainPositionView(discord.ui.View):
@@ -2930,7 +2592,6 @@ class MainPositionView(discord.ui.View):
             f"Deine Hauptpositionen wurden zurückgesetzt.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(fresh_member, "Deine Hauptpositionen wurden zurückgesetzt.")
 
 
 class SidePositionSelect(discord.ui.Select):
@@ -2972,7 +2633,6 @@ class SidePositionSelect(discord.ui.Select):
             f"Deine Nebenpositionen wurden gesetzt: **{text}**\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(fresh_member, "Deine Nebenpositionen wurden gespeichert.")
 
 
 class SidePositionView(discord.ui.View):
@@ -3007,7 +2667,6 @@ class SidePositionView(discord.ui.View):
             f"Deine Nebenpositionen wurden zurückgesetzt.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(fresh_member, "Deine Nebenpositionen wurden zurückgesetzt.")
 
 
 class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
@@ -3062,7 +2721,6 @@ class NumberModal(discord.ui.Modal, title="Trikotnummer setzen"):
             f"Deine Trikotnummer wurde auf **#{raw}** gesetzt.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(fresh_member, "Deine Trikotnummer wurde gespeichert.")
 
 
 class NumberView(discord.ui.View):
@@ -3103,7 +2761,6 @@ class NumberView(discord.ui.View):
             f"Deine Trikotnummer wurde zurückgesetzt.\n\n{next_step_message(fresh_member)}",
             ephemeral=True,
         )
-        await send_private_progress_dm(fresh_member, "Deine Trikotnummer wurde zurückgesetzt.")
 
 
 class LaterModal(discord.ui.Modal, title="Wann kommst du später dazu?"):
@@ -3122,8 +2779,8 @@ class LaterModal(discord.ui.Modal, title="Wann kommst du später dazu?"):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+        if not has_role(interaction.user, ROLE_TESTER):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
 
         raw = self.later_time.value.strip()
@@ -3226,8 +2883,8 @@ class AvailabilityVoteView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+        if not has_role(interaction.user, ROLE_TESTER):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
 
         poll_row = get_poll_by_message_id(interaction.message.id)
@@ -3250,8 +2907,8 @@ class AvailabilityVoteView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+        if not has_role(interaction.user, ROLE_TESTER):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
 
         poll_row = get_poll_by_message_id(interaction.message.id)
@@ -3269,8 +2926,8 @@ class AvailabilityVoteView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+        if not has_role(interaction.user, ROLE_TESTER):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
 
         poll_row = get_poll_by_message_id(interaction.message.id)
@@ -3292,8 +2949,8 @@ class AvailabilityVoteView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        if not has_role(interaction.user, ROLE_FINISHED):
-            await interaction.response.send_message("Du brauchst dafür die Rolle **Fertig**.", ephemeral=True)
+        if not has_role(interaction.user, ROLE_TESTER):
+            await interaction.response.send_message("Du brauchst dafür die Rolle **Tester**.", ephemeral=True)
             return
 
         poll_row = get_poll_by_message_id(interaction.message.id)
@@ -3457,7 +3114,6 @@ async def on_member_join(member: discord.Member):
 
     await ensure_base_name(member)
     await rebuild_profile_from_server_state(member)
-    await send_join_dm(member)
 
 
 @bot.event
@@ -3864,66 +3520,6 @@ async def clubstats_letztes_spiel(interaction: discord.Interaction):
     await interaction.followup.send("Letztes Spiel wurde gepostet.", ephemeral=True)
 
 
-@bot.tree.command(name="sync_old_positions", description="Wandelt alte Positionsrollen serverweit in Haupt-/Nebenrollen um")
-async def sync_old_positions(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member):
-        return
-    if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
-        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
-        return
-
-    guild = interaction.guild
-    if guild is None:
-        return
-
-    await interaction.response.send_message("Sync läuft ...", ephemeral=True)
-
-    processed = 0
-    skipped = 0
-
-    for member in guild.members:
-        if member.bot:
-            continue
-
-        await ensure_base_name(member)
-
-        nick_main_positions = parse_main_positions_from_nick(member)
-        if not nick_main_positions:
-            skipped += 1
-            await asyncio.sleep(1.5)
-            continue
-
-        old_plain_positions = [r.name for r in member.roles if r.name in POSITIONS]
-        old_plain_positions_unique = []
-        for pos in old_plain_positions:
-            if pos not in old_plain_positions_unique:
-                old_plain_positions_unique.append(pos)
-
-        side_positions = [pos for pos in old_plain_positions_unique if pos not in nick_main_positions]
-
-        profile = get_profile(member.id)
-        save_profile(
-            member.id,
-            base_name=profile["base_name"],
-            jersey=profile["jersey"],
-            main_positions=nick_main_positions[:2],
-            side_positions=side_positions,
-        )
-
-        await sync_position_roles(member)
-        await remove_old_plain_position_roles(member)
-        await update_registered_role(member)
-        await update_finished_role(member)
-
-        processed += 1
-        await asyncio.sleep(1.5)
-
-    await interaction.followup.send(
-        f"Sync fertig. Verarbeitet: **{processed}** | Übersprungen ohne erkennbaren Nickname-Positionsblock: **{skipped}**",
-        ephemeral=True,
-    )
-
-
 @bot.tree.command(name="setup_server", description="Erstellt Rollen, Kanäle und Panels für Vollpfosten CR8")
 async def setup_server(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
@@ -3941,8 +3537,6 @@ async def setup_server(interaction: discord.Interaction):
     manager_role = await create_role_if_missing(guild, ROLE_MANAGER, discord.Colour.red())
     stammelf_role = await create_role_if_missing(guild, ROLE_STAMMELF, discord.Colour.gold())
     tester_role = await create_role_if_missing(guild, ROLE_TESTER, discord.Colour.blue())
-    await create_role_if_missing(guild, ROLE_REGISTERED, discord.Colour.green())
-    finished_role = await create_role_if_missing(guild, ROLE_FINISHED, discord.Colour.purple())
 
     for pos in POSITIONS:
         await create_role_if_missing(guild, main_role_name(pos), discord.Colour.orange())
@@ -3951,7 +3545,6 @@ async def setup_server(interaction: discord.Interaction):
     info_cat = await create_category_if_missing(guild, CATEGORY_INFO)
     chat_cat = await create_category_if_missing(guild, CATEGORY_CHAT)
     team_cat = await create_category_if_missing(guild, CATEGORY_TEAM)
-    voice_cat = await create_category_if_missing(guild, CATEGORY_VOICE)
 
     rules_channel = await create_text_if_missing(
         guild,
@@ -3979,24 +3572,24 @@ async def setup_server(interaction: discord.Interaction):
         availability_channel = await guild.create_text_channel(
             name=CH_AVAILABILITY,
             category=chat_cat,
-            overwrites=overwrite_team_locked_text_for_managers(guild, finished_role, manager_role),
+            overwrites=overwrite_team_locked_text_for_managers(guild, tester_role, manager_role),
             reason="Vollpfosten CR8 Setup",
         )
     lineups_channel = await create_text_if_missing(
         guild, chat_cat, CH_LINEUPS,
-        overwrites=overwrite_team_locked_text_for_managers(guild, finished_role, manager_role),
+        overwrites=overwrite_team_locked_text_for_managers(guild, tester_role, manager_role),
     )
     match_reports_channel = await create_text_if_missing(
         guild, chat_cat, CH_MATCH_REPORTS,
-        overwrites=overwrite_team_locked_text_for_managers(guild, finished_role, manager_role),
+        overwrites=overwrite_locked_text_for_managers(guild, manager_role),
     )
 
     await apply_channel_overwrites(rules_channel, overwrite_locked_text_for_managers(guild, manager_role))
     await apply_channel_overwrites(profile_channel, overwrite_locked_text_for_managers(guild, manager_role))
     await apply_channel_overwrites(club_badge_channel, overwrite_locked_text_for_managers(guild, manager_role))
-    await apply_channel_overwrites(availability_channel, overwrite_team_locked_text_for_managers(guild, finished_role, manager_role))
-    await apply_channel_overwrites(lineups_channel, overwrite_team_locked_text_for_managers(guild, finished_role, manager_role))
-    await apply_channel_overwrites(match_reports_channel, overwrite_team_locked_text_for_managers(guild, finished_role, manager_role))
+    await apply_channel_overwrites(availability_channel, overwrite_team_locked_text_for_managers(guild, tester_role, manager_role))
+    await apply_channel_overwrites(lineups_channel, overwrite_team_locked_text_for_managers(guild, tester_role, manager_role))
+    await apply_channel_overwrites(match_reports_channel, overwrite_locked_text_for_managers(guild, manager_role))
 
     await create_text_if_missing(
         guild, chat_cat, CH_GENERAL,
@@ -4014,30 +3607,6 @@ async def setup_server(interaction: discord.Interaction):
         guild, team_cat, CH_STAMMELF,
         overwrites=overwrite_hidden_except(guild, [stammelf_role, manager_role], can_send=True),
     )
-
-    bench_voice = await create_voice_if_missing(
-        guild, voice_cat, VC_BENCH,
-        overwrites=overwrite_voice_bank(guild, manager_role),
-    )
-    kabine_voice = await create_voice_if_missing(
-        guild, voice_cat, VC_STAMMELF,
-        overwrites=overwrite_voice_kabine(guild, finished_role, manager_role, stammelf_role),
-    )
-    manager_voice = await create_voice_if_missing(
-        guild, voice_cat, VC_MANAGER,
-        overwrites=overwrite_voice_manager(guild, manager_role),
-    )
-    other_games_voice = get_voice_channel_by_names(guild, [VC_OTHER_GAMES, "andere games", "Andere Games"])
-    if other_games_voice is None:
-        other_games_voice = await create_voice_if_missing(
-            guild, voice_cat, VC_OTHER_GAMES,
-            overwrites=overwrite_voice_for_finished(guild, finished_role, manager_role),
-        )
-
-    await apply_channel_overwrites(bench_voice, overwrite_voice_bank(guild, manager_role))
-    await apply_channel_overwrites(kabine_voice, overwrite_voice_kabine(guild, finished_role, manager_role, stammelf_role))
-    await apply_channel_overwrites(manager_voice, overwrite_voice_manager(guild, manager_role))
-    await apply_channel_overwrites(other_games_voice, overwrite_voice_for_finished(guild, finished_role, manager_role))
 
     main_positions_text = (
         "## Schritt 1: Hauptpositionen\n"
