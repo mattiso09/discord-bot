@@ -5,6 +5,7 @@ import io
 import asyncio
 import sqlite3
 import gzip
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -582,6 +583,8 @@ def ea_get_json_sync(endpoint: str, params: dict[str, str]):
                 raw = gzip.decompress(raw)
             return json.loads(raw.decode("utf-8"))
     except HTTPError as exc:
+        if exc.code == 403:
+            return ea_get_json_with_curl_sync(url, endpoint)
         try:
             body = exc.read().decode("utf-8", errors="replace")
         except Exception:
@@ -593,6 +596,48 @@ def ea_get_json_sync(endpoint: str, params: dict[str, str]):
         raise EAStatsError("EA API hat zu lange nicht geantwortet.") from exc
     except json.JSONDecodeError as exc:
         raise EAStatsError("EA API hat keine gültigen JSON-Daten geliefert.") from exc
+
+
+def ea_get_json_with_curl_sync(url: str, endpoint: str):
+    command = [
+        "curl",
+        "-L",
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--compressed",
+        "--max-time",
+        "20",
+        "-A",
+        EA_HEADERS["User-Agent"],
+        "-H",
+        f"Accept: {EA_HEADERS['Accept']}",
+        url,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+    except FileNotFoundError as exc:
+        raise EAStatsError(
+            "EA blockt den Python-Request mit 403 und `curl` ist auf dem Host nicht verfügbar."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        message = (exc.stderr or exc.stdout or "").strip()
+        raise EAStatsError(
+            f"EA API {endpoint} wurde auch vom curl-Fallback geblockt: {message[:160]}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise EAStatsError("EA API curl-Fallback hat zu lange nicht geantwortet.") from exc
+
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise EAStatsError("EA API curl-Fallback hat keine gültigen JSON-Daten geliefert.") from exc
 
 
 async def ea_get_json(endpoint: str, params: dict[str, str]):
@@ -3666,6 +3711,58 @@ async def clubstats_check(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     posted = await check_ea_matches()
     await interaction.followup.send(f"Check fertig. Neue Spielberichte gepostet: **{posted}**", ephemeral=True)
+
+
+@bot.tree.command(name="clubstats_setup_id", description="Verbindet EA Clubs direkt per Club-ID")
+@app_commands.choices(platform=[
+    app_commands.Choice(name="PS5 / Xbox Series X|S / PC", value="common-gen5"),
+    app_commands.Choice(name="PS4 / Xbox One", value="common-gen4"),
+    app_commands.Choice(name="Switch", value="nx"),
+])
+async def clubstats_setup_id(
+    interaction: discord.Interaction,
+    club_id: str,
+    club_name: str,
+    platform: app_commands.Choice[str],
+    channel: discord.TextChannel | None = None,
+):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    if not club_id.isdigit():
+        await interaction.response.send_message("Die Club-ID muss nur aus Zahlen bestehen.", ephemeral=True)
+        return
+
+    target_channel = channel
+    if target_channel is None:
+        existing = discord.utils.get(interaction.guild.text_channels, name=CH_MATCH_REPORTS)
+        target_channel = existing if isinstance(existing, discord.TextChannel) else interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message("Bitte gib einen Textkanal für die Spielberichte an.", ephemeral=True)
+        return
+
+    set_setting("ea_club_id", club_id)
+    set_setting("ea_club_name", club_name)
+    set_setting("ea_platform", platform.value)
+    set_setting("ea_stats_channel_id", str(target_channel.id))
+
+    await interaction.response.defer(ephemeral=True)
+    marked = await check_ea_matches(post_new=False, mark_existing=True)
+
+    await interaction.followup.send(
+        (
+            f"Clubstats sind per Club-ID eingerichtet.\n\n"
+            f"Club: **{club_name}** (`{club_id}`)\n"
+            f"Plattform: **{EA_PLATFORM_LABELS.get(platform.value, platform.value)}**\n"
+            f"Kanal: {target_channel.mention}\n"
+            f"Vorhandene letzte Matches wurden als gesehen gespeichert: **{marked}**\n\n"
+            "Neue Spiele werden automatisch gepostet. Falls EA Railway weiterhin blockt, steht die genaue Meldung in **#botlog**."
+        ),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="clubstats_status", description="Zeigt die aktuelle Clubstats-Verbindung")
