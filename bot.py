@@ -584,7 +584,7 @@ def ea_get_json_sync(endpoint: str, params: dict[str, str]):
             return json.loads(raw.decode("utf-8"))
     except HTTPError as exc:
         if exc.code == 403:
-            return ea_get_json_with_curl_sync(url, endpoint)
+            return ea_get_json_browser_fallback_sync(url, endpoint)
         try:
             body = exc.read().decode("utf-8", errors="replace")
         except Exception:
@@ -596,6 +596,47 @@ def ea_get_json_sync(endpoint: str, params: dict[str, str]):
         raise EAStatsError("EA API hat zu lange nicht geantwortet.") from exc
     except json.JSONDecodeError as exc:
         raise EAStatsError("EA API hat keine gültigen JSON-Daten geliefert.") from exc
+
+
+def ea_get_json_browser_fallback_sync(url: str, endpoint: str):
+    try:
+        return ea_get_json_with_curl_cffi_sync(url, endpoint)
+    except EAStatsError as cffi_error:
+        try:
+            return ea_get_json_with_curl_sync(url, endpoint)
+        except EAStatsError as curl_error:
+            raise EAStatsError(f"{cffi_error} | {curl_error}") from curl_error
+
+
+def ea_get_json_with_curl_cffi_sync(url: str, endpoint: str):
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise EAStatsError("EA blockt den Python-Request mit 403 und `curl_cffi` ist nicht installiert.") from exc
+
+    try:
+        response = curl_requests.get(
+            url,
+            headers={
+                "User-Agent": EA_HEADERS["User-Agent"],
+                "Accept": EA_HEADERS["Accept"],
+                "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+            },
+            impersonate="chrome124",
+            timeout=20,
+        )
+    except Exception as exc:
+        raise EAStatsError(f"EA API {endpoint} curl_cffi-Fallback fehlgeschlagen: {exc}") from exc
+
+    if response.status_code != 200:
+        raise EAStatsError(
+            f"EA API {endpoint} wurde auch vom curl_cffi-Fallback geblockt: Status {response.status_code}"
+        )
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise EAStatsError("EA API curl_cffi-Fallback hat keine gültigen JSON-Daten geliefert.") from exc
 
 
 def ea_get_json_with_curl_sync(url: str, endpoint: str):
