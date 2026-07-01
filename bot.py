@@ -83,45 +83,29 @@ MAIN_POSITIONS_MARKER = "[VCR8_MAIN_POSITIONS_PANEL]"
 SIDE_POSITIONS_MARKER = "[VCR8_SIDE_POSITIONS_PANEL]"
 NUMBERS_MARKER = "[VCR8_NUMBERS_PANEL]"
 
-RULES_TEXT = """📜 **Regeln für Vollpfosten CR8**
+RULES_TEXT = """## Willkommen bei Vollpfosten CR8
 
-Willkommen im Vereinsserver!
-Mit dem Akzeptieren der Regeln verpflichtest du dich, dich an folgende Punkte zu halten:
+So bist du in unter 1 Minute startklar:
 
-**Respekt & Umgang**
-- Behandle alle Mitglieder respektvoll
-- Kein Beleidigen, Provozieren oder unnötiges Drama
+**1. Regeln akzeptieren**
+Drücke unten auf den Button. Danach bekommst du die Rolle **Tester**.
 
-**Verhalten im Spiel**
-- Kein unnötiges Geflame oder Rage
-- Bei wichtigen Spielen wird konzentriert gespielt
-- Spaß ist erlaubt, aber nicht auf Kosten des Teams
+**2. Profil ausfüllen**
+Gehe in **#profil** und wähle:
+- 1-2 Hauptpositionen
+- eine freie Trikotnummer
+- optional Nebenpositionen
 
-**Teamplay**
-- Teamplay steht immer über Ego-Play
-- Halte deine Position und spiel fürs Team
-- Kommunikation ist wichtig
+**3. Mitspielen**
+Wenn alles fertig ist, bekommst du automatisch Zugriff auf die wichtigen Kanäle und Voice-Chats.
 
-**Organisation**
-- Höre auf Ansagen von Managern und Stammelf
-- Reagiere auf Verfügbarkeitsabfragen ehrlich
-- Sei pünktlich zu Spielen und Training
+**Kurzregeln**
+- Respektvoll bleiben, kein Spam, kein unnötiges Drama.
+- Teamplay geht vor Ego-Play.
+- Auf Manager-Ansagen hören.
+- Bei Verfügbarkeitsabfragen ehrlich abstimmen.
 
-**Aktivität & Zuverlässigkeit**
-- Wer dauerhaft unzuverlässig ist, muss mit Konsequenzen rechnen
-- Abmelden ist Pflicht, wenn du nicht kannst
-
-**Discord Verhalten**
-- Kein Spam in Channels oder Voice
-- Nutze die richtigen Channels (z. B. Clips nur in #clips)
-- Halte den Server übersichtlich
-
-**Allgemein**
-- Jeder vertritt mit seinem Verhalten den Verein
-- Entscheidungen der Manager sind zu respektieren
-
-Drücke unten auf den Button, um die Regeln zu akzeptieren und die Rolle **Tester** zu erhalten.
-Danach gehst du in **#profil** und trägst dort Hauptpositionen und Trikotnummer ein. Nebenpositionen sind freiwillig.
+Nebenpositionen sind freiwillig. Wenn du nur eine Position spielst oder deine zwei Positionen beide Hauptpositionen sind, musst du keine Nebenposition auswählen.
 """
 
 POLL_NOTE = "Hinweis: Du musst **nicht** exakt zur angegebenen Startzeit da sein."
@@ -845,25 +829,23 @@ def next_step_message(member: discord.Member):
     profile = get_profile(member.id)
 
     if not has_role(member, ROLE_TESTER):
-        return "Bitte akzeptiere zuerst die Regeln im Channel **#regeln**."
+        return "Nächster Schritt: Öffne **#regeln** und klicke auf **Regeln akzeptieren**."
     if not (1 <= len(profile["main_positions"]) <= 2):
-        return "Bitte öffne **#profil** und wähle dort **mindestens 1 und maximal 2 Hauptpositionen**."
+        return "Nächster Schritt: Öffne **#profil** und wähle **1-2 Hauptpositionen**."
     if not profile["jersey"]:
-        return "Bitte öffne **#profil** und setze dort deine **freie Trikotnummer**."
-    return "✅ Du bist jetzt vollständig registriert und kannst mitspielen."
+        return "Nächster Schritt: Setze in **#profil** deine **freie Trikotnummer**."
+    return "✅ Fertig. Du bist registriert und kannst mitspielen."
 
 
 async def send_join_dm(member: discord.Member):
     fresh = await get_fresh_member(member)
     text = (
         f"Willkommen auf **{fresh.guild.name}**.\n\n"
-        "**So kommst du ins Team:**\n"
-        "1. Öffne **#regeln** und drücke **Regeln akzeptieren**.\n"
-        "2. Öffne danach **#profil**.\n"
-        "3. Wähle deine **Hauptpositionen**.\n"
-        "4. Setze eine **freie Trikotnummer**.\n"
-        "5. Optional: Wähle **Nebenpositionen**, wenn du noch weitere Positionen spielen kannst.\n\n"
-        "Der Bot aktualisiert danach automatisch deine Rollen und deinen Nickname.\n\n"
+        "**Dein Start in 3 Schritten:**\n"
+        "1. **#regeln** öffnen und Regeln akzeptieren.\n"
+        "2. **#profil** öffnen, Hauptpositionen wählen und Trikotnummer setzen.\n"
+        "3. Optional Nebenpositionen wählen. Wenn du keine hast, einfach überspringen.\n\n"
+        "Der Bot setzt Rollen, Nickname und Zugriff automatisch.\n\n"
         f"{next_step_message(fresh)}"
     )
     try:
@@ -3271,27 +3253,25 @@ async def setup_server(interaction: discord.Interaction):
     await apply_channel_overwrites(other_games_voice, overwrite_voice_for_finished(guild, finished_role, manager_role))
 
     main_positions_text = (
-        "## Hauptpositionen\n"
-        "Wähle hier **mindestens 1 und maximal 2 Hauptpositionen**.\n"
-        "Nur diese Hauptpositionen werden in deinen Nicknamen übernommen.\n"
-        "Für Hauptpositionen bekommst du Rollen wie **Haupt-ST**.\n\n"
-        "Mit dem roten Button kannst du deine Hauptpositionen zurücksetzen."
+        "## Schritt 1: Hauptpositionen\n"
+        "Wähle **1-2 Positionen**, die du am liebsten spielst.\n"
+        "Diese Positionen stehen später in deinem Nickname.\n\n"
+        "Beispiele: **ST**, **ZOM**, **IV**.\n"
+        "Mit dem roten Button kannst du deine Auswahl zurücksetzen."
     )
 
     side_positions_text = (
-        "## Nebenpositionen\n"
-        "Wähle hier freiwillig Nebenpositionen, wenn du außer deinen Hauptpositionen noch weitere Positionen spielen kannst.\n"
-        "Wenn du nur 1 Position spielst oder deine 2 Positionen beide als Hauptposition gewählt hast, musst du hier nichts auswählen.\n"
-        "Diese werden als Rollen gespeichert, aber **nicht** in deinen Nicknamen übernommen.\n"
-        "Für Nebenpositionen bekommst du Rollen wie **Neben-ST**.\n\n"
+        "## Schritt 2: Nebenpositionen\n"
+        "Optional: Wähle weitere Positionen, die du auch spielen kannst.\n\n"
+        "Du kannst diesen Schritt überspringen, wenn du keine Nebenposition hast oder deine 2 Positionen schon als Hauptposition gewählt wurden.\n"
         "Mit dem roten Button kannst du deine Nebenpositionen zurücksetzen."
     )
 
     numbers_text = (
-        "## Trikotnummer\n"
-        "Setze hier deine Trikotnummer. Jede Nummer kann nur **einmal** vergeben werden.\n"
-        "Die Nummer wird zusammen mit deinen Hauptpositionen in deinen Nicknamen übernommen.\n\n"
-        "Mit dem roten Button kannst du deine Trikotnummer zurücksetzen."
+        "## Schritt 3: Trikotnummer\n"
+        "Setze deine freie Nummer. Jede Nummer kann nur **einmal** vergeben werden.\n\n"
+        "Danach bist du fertig und der Bot aktualisiert deinen Nickname automatisch.\n"
+        "Mit dem roten Button kannst du deine Nummer zurücksetzen."
     )
 
     await replace_panel_message(rules_channel, RULES_MARKER, RULES_TEXT, RulesView(), interaction.client.user)
