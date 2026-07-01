@@ -4,9 +4,13 @@ import json
 import io
 import asyncio
 import sqlite3
+import gzip
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import discord
 from discord.ext import commands
@@ -72,6 +76,7 @@ CH_MANAGER = "manager-chat"
 CH_STAMMELF = "stammelf-chat"
 CH_LINEUPS = "aufstellungen"
 CH_AVAILABILITY = "verfuegbarkeit"
+CH_MATCH_REPORTS = "spielberichte"
 
 VC_BENCH = "bank"
 VC_STAMMELF = "kabine"
@@ -203,6 +208,20 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             missed_count INTEGER DEFAULT 0,
             last_warned_at_count INTEGER DEFAULT 0
+        )
+        """
+    )
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ea_club_matches (
+            match_id TEXT NOT NULL,
+            match_type TEXT NOT NULL,
+            channel_id INTEGER,
+            message_id INTEGER,
+            snapshot_json TEXT NOT NULL,
+            posted_at TEXT NOT NULL,
+            PRIMARY KEY (match_id, match_type)
         )
         """
     )
@@ -523,8 +542,348 @@ def set_setting(key: str, value: str):
     con.close()
 
 
+def delete_setting(key: str):
+    con = db()
+    con.execute("DELETE FROM settings WHERE key = ?", (key,))
+    con.commit()
+    con.close()
+
+
 def is_auto_availability_enabled():
     return get_setting("auto_availability_enabled", "1") == "1"
+
+
+EA_API_BASE_URL = "https://proclubs.ea.com/api/fc/"
+EA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/112.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+}
+EA_MATCH_TYPES = ("leagueMatch", "playoffMatch")
+EA_PLATFORM_LABELS = {
+    "common-gen5": "PS5 / Xbox Series X|S / PC",
+    "common-gen4": "PS4 / Xbox One",
+    "nx": "Switch",
+}
+
+
+class EAStatsError(Exception):
+    pass
+
+
+def ea_get_json_sync(endpoint: str, params: dict[str, str]):
+    url = f"{EA_API_BASE_URL}{endpoint}?{urlencode(params)}"
+    request = Request(url, headers=EA_HEADERS, method="GET")
+    try:
+        with urlopen(request, timeout=20) as response:
+            raw = response.read()
+            encoding = response.headers.get("Content-Encoding", "")
+            if "gzip" in encoding:
+                raw = gzip.decompress(raw)
+            return json.loads(raw.decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        raise EAStatsError(f"EA API {endpoint} hat Status {exc.code}: {body[:120]}") from exc
+    except URLError as exc:
+        raise EAStatsError(f"EA API Anfrage fehlgeschlagen: {exc}") from exc
+    except TimeoutError as exc:
+        raise EAStatsError("EA API hat zu lange nicht geantwortet.") from exc
+    except json.JSONDecodeError as exc:
+        raise EAStatsError("EA API hat keine gültigen JSON-Daten geliefert.") from exc
+
+
+async def ea_get_json(endpoint: str, params: dict[str, str]):
+    return await asyncio.to_thread(ea_get_json_sync, endpoint, params)
+
+
+async def ea_search_club(club_name: str, platform: str):
+    return await ea_get_json(
+        "allTimeLeaderboard/search",
+        {"platform": platform, "clubName": club_name},
+    )
+
+
+async def ea_fetch_matches(club_id: str, platform: str, match_type: str):
+    return await ea_get_json(
+        "clubs/matches",
+        {"platform": platform, "clubIds": str(club_id), "matchType": match_type},
+    )
+
+
+async def ea_fetch_member_stats(club_id: str, platform: str):
+    return await ea_get_json(
+        "members/stats",
+        {"platform": platform, "clubId": str(club_id)},
+    )
+
+
+def int_stat(data: dict, key: str, default: int = 0) -> int:
+    try:
+        return int(float(data.get(key, default) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def float_stat(data: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(data.get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def percent(made: int, attempts: int) -> str:
+    if attempts <= 0:
+        return "-"
+    return f"{round((made / attempts) * 100)}%"
+
+
+def format_match_time(timestamp: int | str | None) -> str:
+    try:
+        value = int(timestamp)
+    except (TypeError, ValueError):
+        return "unbekannt"
+    return datetime.fromtimestamp(value, BOT_TZ).strftime("%d.%m.%Y %H:%M")
+
+
+def get_configured_ea_club():
+    club_id = get_setting("ea_club_id")
+    platform = get_setting("ea_platform")
+    if not club_id or not platform:
+        return None
+    return {
+        "club_id": club_id,
+        "club_name": get_setting("ea_club_name", "Vollpfosten CR8"),
+        "platform": platform,
+        "channel_id": get_setting("ea_stats_channel_id"),
+    }
+
+
+def get_own_and_opponent(match: dict, club_id: str):
+    clubs = match.get("clubs", {})
+    own = clubs.get(str(club_id))
+    opponent = None
+    for current_id, club_data in clubs.items():
+        if str(current_id) != str(club_id):
+            opponent = club_data
+            break
+    return own, opponent
+
+
+def get_match_players(match: dict, club_id: str) -> list[dict]:
+    raw_players = match.get("players", {}).get(str(club_id), {})
+    players = []
+    for player_id, stats in raw_players.items():
+        item = dict(stats)
+        item["player_id"] = str(player_id)
+        item["playername"] = item.get("playername") or item.get("name") or f"Spieler {player_id}"
+        players.append(item)
+    return sorted(players, key=lambda p: float_stat(p, "rating"), reverse=True)
+
+
+def player_short_line(player: dict) -> str:
+    goals = int_stat(player, "goals")
+    assists = int_stat(player, "assists")
+    rating = float_stat(player, "rating")
+    passes = int_stat(player, "passesmade")
+    pass_attempts = int_stat(player, "passattempts")
+    tackles = int_stat(player, "tacklesmade")
+    tackle_attempts = int_stat(player, "tackleattempts")
+    return (
+        f"**{player['playername']}** - {rating:.1f} Rating | "
+        f"{goals}T/{assists}A | Pass {percent(passes, pass_attempts)} | Tackles {tackles}/{tackle_attempts}"
+    )
+
+
+def build_match_report_embed(match: dict, club_id: str, match_type: str) -> discord.Embed:
+    own, opponent = get_own_and_opponent(match, club_id)
+    if not own:
+        raise EAStatsError("Eigener Club wurde im Match nicht gefunden.")
+
+    own_name = own.get("details", {}).get("name", get_setting("ea_club_name", "Unser Club"))
+    opponent_name = opponent.get("details", {}).get("name", "Gegner") if opponent else "Gegner"
+    own_goals = int_stat(own, "goals")
+    opponent_goals = int_stat(opponent or {}, "goals")
+    result = "Sieg" if own_goals > opponent_goals else "Niederlage" if own_goals < opponent_goals else "Unentschieden"
+    color = discord.Color.green() if result == "Sieg" else discord.Color.red() if result == "Niederlage" else discord.Color.gold()
+
+    players = get_match_players(match, club_id)
+    totals = {
+        "goals": sum(int_stat(p, "goals") for p in players),
+        "assists": sum(int_stat(p, "assists") for p in players),
+        "shots": sum(int_stat(p, "shots") for p in players),
+        "passes": sum(int_stat(p, "passesmade") for p in players),
+        "pass_attempts": sum(int_stat(p, "passattempts") for p in players),
+        "tackles": sum(int_stat(p, "tacklesmade") for p in players),
+        "tackle_attempts": sum(int_stat(p, "tackleattempts") for p in players),
+        "saves": sum(int_stat(p, "saves") for p in players),
+        "redcards": sum(int_stat(p, "redcards") for p in players),
+    }
+
+    embed = discord.Embed(
+        title=f"{result}: {own_name} {own_goals}:{opponent_goals} {opponent_name}",
+        description=f"**{match_type_label(match_type)}** | {format_match_time(match.get('timestamp'))}",
+        color=color,
+    )
+    embed.add_field(
+        name="Teamstats",
+        value=(
+            f"Schüsse: **{totals['shots']}**\n"
+            f"Tore/Assists: **{totals['goals']} / {totals['assists']}**\n"
+            f"Passgenauigkeit: **{percent(totals['passes'], totals['pass_attempts'])}** "
+            f"({totals['passes']}/{totals['pass_attempts']})\n"
+            f"Tackles: **{totals['tackles']}/{totals['tackle_attempts']}**\n"
+            f"Paraden: **{totals['saves']}** | Rote Karten: **{totals['redcards']}**\n"
+            "xG: **nicht von EA geliefert**"
+        ),
+        inline=False,
+    )
+
+    top_players = players[:5]
+    embed.add_field(
+        name="Topspieler",
+        value="\n".join(player_short_line(player) for player in top_players) if top_players else "-",
+        inline=False,
+    )
+    embed.set_footer(text=f"Match-ID: {match.get('matchId')} | EA Clubs Daten")
+    return embed
+
+
+def match_type_label(match_type: str) -> str:
+    return "Playoff-Spiel" if match_type == "playoffMatch" else "Liga-Spiel"
+
+
+def build_player_stats_embed(match: dict, club_id: str, player_id: str) -> discord.Embed:
+    players = match.get("players", {}).get(str(club_id), {})
+    player = players.get(str(player_id))
+    if player is None:
+        raise EAStatsError("Spieler wurde in diesem Match nicht gefunden.")
+
+    name = player.get("playername", "Spieler")
+    passes = int_stat(player, "passesmade")
+    pass_attempts = int_stat(player, "passattempts")
+    tackles = int_stat(player, "tacklesmade")
+    tackle_attempts = int_stat(player, "tackleattempts")
+
+    embed = discord.Embed(
+        title=f"Spieler-Stats: {name}",
+        description=f"Match-ID: `{match.get('matchId')}`",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Offensive",
+        value=(
+            f"Tore: **{int_stat(player, 'goals')}**\n"
+            f"Assists: **{int_stat(player, 'assists')}**\n"
+            f"Schüsse: **{int_stat(player, 'shots')}**\n"
+            "xG: **nicht von EA geliefert**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Spielaufbau",
+        value=(
+            f"Pässe: **{passes}/{pass_attempts}**\n"
+            f"Passgenauigkeit: **{percent(passes, pass_attempts)}**\n"
+            f"Position: **{player.get('pos', '-')}**\n"
+            f"Rating: **{float_stat(player, 'rating'):.2f}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Defensive/Torwart",
+        value=(
+            f"Tackles: **{tackles}/{tackle_attempts}**\n"
+            f"Tacklequote: **{percent(tackles, tackle_attempts)}**\n"
+            f"Paraden: **{int_stat(player, 'saves')}**\n"
+            f"Gegentore: **{int_stat(player, 'goalsconceded')}**\n"
+            f"Clean Sheets: **{int_stat(player, 'cleansheetsany')}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Sonstiges",
+        value=(
+            f"Spielzeit: **{int_stat(player, 'secondsPlayed') // 60} Min.**\n"
+            f"MOTM: **{'Ja' if int_stat(player, 'mom') else 'Nein'}**\n"
+            f"Rote Karten: **{int_stat(player, 'redcards')}**"
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def save_ea_match(match_id: str, match_type: str, channel_id: int | None, message_id: int | None, snapshot: dict):
+    con = db()
+    con.execute(
+        """
+        INSERT INTO ea_club_matches (match_id, match_type, channel_id, message_id, snapshot_json, posted_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(match_id, match_type) DO UPDATE SET
+            channel_id = excluded.channel_id,
+            message_id = excluded.message_id,
+            snapshot_json = excluded.snapshot_json
+        """,
+        (
+            str(match_id),
+            match_type,
+            channel_id,
+            message_id,
+            json.dumps(snapshot, ensure_ascii=False),
+            datetime.now(BOT_TZ).isoformat(),
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def mark_ea_match_seen(match_id: str, match_type: str, snapshot: dict):
+    save_ea_match(str(match_id), match_type, None, None, snapshot)
+
+
+def ea_match_exists(match_id: str, match_type: str) -> bool:
+    con = db()
+    row = con.execute(
+        "SELECT 1 FROM ea_club_matches WHERE match_id = ? AND match_type = ? LIMIT 1",
+        (str(match_id), match_type),
+    ).fetchone()
+    con.close()
+    return row is not None
+
+
+def get_ea_match_by_message_id(message_id: int):
+    con = db()
+    row = con.execute(
+        "SELECT * FROM ea_club_matches WHERE message_id = ? LIMIT 1",
+        (message_id,),
+    ).fetchone()
+    con.close()
+    if row is None:
+        return None
+    data = dict(row)
+    data["snapshot"] = json.loads(data["snapshot_json"])
+    return data
+
+
+def get_latest_posted_ea_match():
+    con = db()
+    row = con.execute(
+        """
+        SELECT *
+        FROM ea_club_matches
+        WHERE message_id IS NOT NULL
+        ORDER BY posted_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    con.close()
+    if row is None:
+        return None
+    data = dict(row)
+    data["snapshot"] = json.loads(data["snapshot_json"])
+    return data
 
 
 def get_warning_info(user_id: int):
@@ -2291,12 +2650,87 @@ async def process_poll_reminders():
                 mark_poll_cleanup_deleted(poll_row["id"])
 
 
+async def send_botlog_message(guild: discord.Guild, text: str):
+    channel = discord.utils.get(guild.text_channels, name="botlog")
+    if channel is None:
+        return
+    try:
+        await channel.send(text)
+    except discord.HTTPException:
+        pass
+
+
+async def get_match_report_channel(guild: discord.Guild):
+    configured_channel_id = get_setting("ea_stats_channel_id")
+    if configured_channel_id and configured_channel_id.isdigit():
+        channel = guild.get_channel(int(configured_channel_id))
+        if isinstance(channel, discord.TextChannel):
+            return channel
+
+    channel = discord.utils.get(guild.text_channels, name=CH_MATCH_REPORTS)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    return discord.utils.get(guild.text_channels, name="botlog")
+
+
+async def post_ea_match_report(guild: discord.Guild, match: dict, match_type: str, club_id: str):
+    channel = await get_match_report_channel(guild)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    embed = build_match_report_embed(match, club_id, match_type)
+    try:
+        message = await channel.send(embed=embed, view=MatchStatsView())
+    except discord.HTTPException as exc:
+        await send_botlog_message(guild, f"Stats-Post konnte nicht gesendet werden: `{exc}`")
+        return
+
+    save_ea_match(str(match.get("matchId")), match_type, channel.id, message.id, match)
+
+
+async def check_ea_matches(*, post_new: bool = True, mark_existing: bool = False) -> int:
+    config = get_configured_ea_club()
+    if config is None:
+        return 0
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return 0
+
+    posted = 0
+    for match_type in EA_MATCH_TYPES:
+        try:
+            matches = await ea_fetch_matches(config["club_id"], config["platform"], match_type)
+        except EAStatsError as exc:
+            await send_botlog_message(guild, f"EA-Stats konnten nicht geladen werden ({match_type_label(match_type)}): `{exc}`")
+            continue
+
+        if not isinstance(matches, list):
+            continue
+
+        for match in sorted(matches, key=lambda item: int_stat(item, "timestamp")):
+            match_id = str(match.get("matchId", ""))
+            if not match_id or ea_match_exists(match_id, match_type):
+                continue
+
+            if mark_existing or not post_new:
+                mark_ea_match_seen(match_id, match_type, match)
+                posted += 1
+                continue
+
+            await post_ea_match_report(guild, match, match_type, config["club_id"])
+            posted += 1
+
+    return posted
+
+
 async def background_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
             await maybe_create_daily_funclub_poll()
             await process_poll_reminders()
+            await check_ea_matches()
         except Exception as e:
             print(f"Fehler im Hintergrundloop: {e}")
         await asyncio.sleep(60)
@@ -2627,6 +3061,76 @@ class LaterModal(discord.ui.Modal, title="Wann kommst du später dazu?"):
         await interaction.followup.send("Du wurdest als **Komme später** eingetragen.", ephemeral=True)
 
 
+class PlayerStatsSelect(discord.ui.Select):
+    def __init__(self, match_row: dict):
+        self.match_row = match_row
+        snapshot = match_row["snapshot"]
+        club_id = get_setting("ea_club_id", "")
+        players = get_match_players(snapshot, club_id)[:25]
+        options = [
+            discord.SelectOption(
+                label=player["playername"][:100],
+                value=player["player_id"],
+                description=(
+                    f"{float_stat(player, 'rating'):.1f} Rating | "
+                    f"{int_stat(player, 'goals')}T/{int_stat(player, 'assists')}A"
+                )[:100],
+            )
+            for player in players
+        ]
+        if not options:
+            options = [discord.SelectOption(label="Keine Spieler gefunden", value="none")]
+        super().__init__(
+            placeholder="Spieler auswählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("Für dieses Match wurden keine Spieler gefunden.", ephemeral=True)
+            return
+        try:
+            embed = build_player_stats_embed(
+                self.match_row["snapshot"],
+                get_setting("ea_club_id", ""),
+                self.values[0],
+            )
+        except EAStatsError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class PlayerStatsSelectView(discord.ui.View):
+    def __init__(self, match_row: dict):
+        super().__init__(timeout=180)
+        self.add_item(PlayerStatsSelect(match_row))
+
+
+class MatchStatsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Spieler-Stats anzeigen", style=discord.ButtonStyle.primary, custom_id="vcr8:match_stats:players")
+    async def show_players(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.message is None:
+            await interaction.response.send_message("Match-Nachricht wurde nicht gefunden.", ephemeral=True)
+            return
+
+        match_row = get_ea_match_by_message_id(interaction.message.id)
+        if match_row is None:
+            await interaction.response.send_message("Für diesen Spielbericht sind keine gespeicherten Matchdaten vorhanden.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "Wähle einen Spieler aus diesem Match:",
+            view=PlayerStatsSelectView(match_row),
+            ephemeral=True,
+        )
+
+
 class AvailabilityVoteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -2832,6 +3336,7 @@ class VollpfostenBot(commands.Bot):
         self.add_view(SidePositionView())
         self.add_view(NumberView())
         self.add_view(AvailabilityVoteView())
+        self.add_view(MatchStatsView())
 
         guild_obj = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild_obj)
@@ -3082,6 +3587,145 @@ async def auto_verfuegbarkeit_aus(interaction: discord.Interaction):
     await interaction.response.send_message("Die automatische Verfügbarkeitsabfrage um **12:00 Uhr** ist jetzt **deaktiviert**.", ephemeral=True)
 
 
+@bot.tree.command(name="clubstats_setup", description="Verbindet den Bot mit eurem EA Clubs Team")
+@app_commands.choices(platform=[
+    app_commands.Choice(name="PS5 / Xbox Series X|S / PC", value="common-gen5"),
+    app_commands.Choice(name="PS4 / Xbox One", value="common-gen4"),
+    app_commands.Choice(name="Switch", value="nx"),
+])
+async def clubstats_setup(
+    interaction: discord.Interaction,
+    club_name: str,
+    platform: app_commands.Choice[str],
+    channel: discord.TextChannel | None = None,
+):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        results = await ea_search_club(club_name, platform.value)
+    except EAStatsError as exc:
+        await interaction.followup.send(f"EA-Clubsuche fehlgeschlagen: `{exc}`", ephemeral=True)
+        return
+
+    if not results:
+        await interaction.followup.send("Ich habe keinen Club mit diesem Namen auf dieser Plattform gefunden.", ephemeral=True)
+        return
+
+    selected = next(
+        (club for club in results if str(club.get("clubName", "")).lower() == club_name.lower()),
+        results[0],
+    )
+    club_id = str(selected.get("clubId") or selected.get("clubInfo", {}).get("clubId") or "")
+    resolved_name = str(selected.get("clubName") or selected.get("clubInfo", {}).get("name") or club_name)
+    if not club_id:
+        await interaction.followup.send("Der Club wurde gefunden, aber EA hat keine Club-ID geliefert.", ephemeral=True)
+        return
+
+    target_channel = channel
+    if target_channel is None:
+        existing = discord.utils.get(interaction.guild.text_channels, name=CH_MATCH_REPORTS)
+        target_channel = existing if isinstance(existing, discord.TextChannel) else interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.followup.send("Bitte gib einen Textkanal für die Spielberichte an.", ephemeral=True)
+        return
+
+    set_setting("ea_club_id", club_id)
+    set_setting("ea_club_name", resolved_name)
+    set_setting("ea_platform", platform.value)
+    set_setting("ea_stats_channel_id", str(target_channel.id))
+
+    marked = await check_ea_matches(post_new=False, mark_existing=True)
+
+    await interaction.followup.send(
+        (
+            f"Clubstats sind eingerichtet.\n\n"
+            f"Club: **{resolved_name}** (`{club_id}`)\n"
+            f"Plattform: **{EA_PLATFORM_LABELS.get(platform.value, platform.value)}**\n"
+            f"Kanal: {target_channel.mention}\n"
+            f"Vorhandene letzte Matches wurden als gesehen gespeichert: **{marked}**\n\n"
+            "Neue Spiele werden automatisch gepostet."
+        ),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="clubstats_check", description="Prüft sofort auf neue EA Clubs Spiele")
+async def clubstats_check(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    posted = await check_ea_matches()
+    await interaction.followup.send(f"Check fertig. Neue Spielberichte gepostet: **{posted}**", ephemeral=True)
+
+
+@bot.tree.command(name="clubstats_status", description="Zeigt die aktuelle Clubstats-Verbindung")
+async def clubstats_status(interaction: discord.Interaction):
+    config = get_configured_ea_club()
+    if config is None:
+        await interaction.response.send_message("Clubstats sind noch nicht eingerichtet. Nutze `/clubstats_setup`.", ephemeral=True)
+        return
+
+    channel_text = "nicht gesetzt"
+    if config.get("channel_id") and str(config["channel_id"]).isdigit():
+        channel = interaction.guild.get_channel(int(config["channel_id"])) if interaction.guild else None
+        channel_text = channel.mention if isinstance(channel, discord.TextChannel) else f"`{config['channel_id']}`"
+
+    await interaction.response.send_message(
+        (
+            f"Club: **{config['club_name']}** (`{config['club_id']}`)\n"
+            f"Plattform: **{EA_PLATFORM_LABELS.get(config['platform'], config['platform'])}**\n"
+            f"Kanal: {channel_text}"
+        ),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="clubstats_letztes_spiel", description="Postet das neueste EA Clubs Spiel erneut")
+async def clubstats_letztes_spiel(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member):
+        return
+    if not is_manager(interaction.user) and interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("Dafür brauchst du Manager-Rechte.", ephemeral=True)
+        return
+
+    config = get_configured_ea_club()
+    if config is None:
+        await interaction.response.send_message("Clubstats sind noch nicht eingerichtet. Nutze `/clubstats_setup`.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    latest = None
+    latest_type = "leagueMatch"
+    for match_type in EA_MATCH_TYPES:
+        try:
+            matches = await ea_fetch_matches(config["club_id"], config["platform"], match_type)
+        except EAStatsError:
+            continue
+        if not isinstance(matches, list):
+            continue
+        for match in matches:
+            if latest is None or int_stat(match, "timestamp") > int_stat(latest, "timestamp"):
+                latest = match
+                latest_type = match_type
+
+    if latest is None:
+        await interaction.followup.send("Ich habe kein letztes Spiel gefunden.", ephemeral=True)
+        return
+
+    await post_ea_match_report(interaction.guild, latest, latest_type, config["club_id"])
+    await interaction.followup.send("Letztes Spiel wurde gepostet.", ephemeral=True)
+
+
 @bot.tree.command(name="sync_old_positions", description="Wandelt alte Positionsrollen serverweit in Haupt-/Nebenrollen um")
 async def sync_old_positions(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
@@ -3204,12 +3848,17 @@ async def setup_server(interaction: discord.Interaction):
         guild, chat_cat, CH_LINEUPS,
         overwrites=overwrite_team_locked_text_for_managers(guild, finished_role, manager_role),
     )
+    match_reports_channel = await create_text_if_missing(
+        guild, chat_cat, CH_MATCH_REPORTS,
+        overwrites=overwrite_team_locked_text_for_managers(guild, finished_role, manager_role),
+    )
 
     await apply_channel_overwrites(rules_channel, overwrite_locked_text_for_managers(guild, manager_role))
     await apply_channel_overwrites(profile_channel, overwrite_locked_text_for_managers(guild, manager_role))
     await apply_channel_overwrites(club_badge_channel, overwrite_locked_text_for_managers(guild, manager_role))
     await apply_channel_overwrites(availability_channel, overwrite_team_locked_text_for_managers(guild, finished_role, manager_role))
     await apply_channel_overwrites(lineups_channel, overwrite_team_locked_text_for_managers(guild, finished_role, manager_role))
+    await apply_channel_overwrites(match_reports_channel, overwrite_team_locked_text_for_managers(guild, finished_role, manager_role))
 
     await create_text_if_missing(
         guild, chat_cat, CH_GENERAL,
