@@ -185,7 +185,8 @@ def init_db():
             yes_threshold_announced INTEGER DEFAULT 0,
             remind_60_sent INTEGER DEFAULT 0,
             remind_5_sent INTEGER DEFAULT 0,
-            closed INTEGER DEFAULT 0
+            closed INTEGER DEFAULT 0,
+            cleanup_deleted INTEGER DEFAULT 0
         )
         """
     )
@@ -250,6 +251,8 @@ def migrate_db():
         con.execute("ALTER TABLE polls ADD COLUMN remind_5_sent INTEGER DEFAULT 0")
     if "closed" not in cols_polls:
         con.execute("ALTER TABLE polls ADD COLUMN closed INTEGER DEFAULT 0")
+    if "cleanup_deleted" not in cols_polls:
+        con.execute("ALTER TABLE polls ADD COLUMN cleanup_deleted INTEGER DEFAULT 0")
 
     cols_votes = [row["name"] for row in con.execute("PRAGMA table_info(poll_votes)").fetchall()]
     if "later_time" not in cols_votes:
@@ -386,6 +389,21 @@ def get_open_polls():
     return rows
 
 
+def get_polls_pending_cleanup():
+    con = db()
+    rows = con.execute(
+        """
+        SELECT *
+        FROM polls
+        WHERE cleanup_deleted = 0
+          AND message_id IS NOT NULL
+          AND channel_id IS NOT NULL
+        """
+    ).fetchall()
+    con.close()
+    return rows
+
+
 def get_latest_poll_message_id_for_channel(channel_id: int):
     con = db()
     row = con.execute(
@@ -479,6 +497,13 @@ def mark_poll_reminder_5(poll_id: int):
 def close_poll(poll_id: int):
     con = db()
     con.execute("UPDATE polls SET closed = 1 WHERE id = ?", (poll_id,))
+    con.commit()
+    con.close()
+
+
+def mark_poll_cleanup_deleted(poll_id: int):
+    con = db()
+    con.execute("UPDATE polls SET cleanup_deleted = 1 WHERE id = ?", (poll_id,))
     con.commit()
     con.close()
 
@@ -2136,26 +2161,30 @@ async def notify_nonvoters(guild: discord.Guild, poll_row):
             except discord.HTTPException:
                 pass
 
-async def cleanup_expired_poll_message(guild: discord.Guild, poll_row):
+async def cleanup_expired_poll_message(guild: discord.Guild, poll_row, *, force: bool = False) -> bool:
     channel = guild.get_channel(poll_row["channel_id"])
     if channel is None or not isinstance(channel, discord.TextChannel):
-        return
+        return False
 
-    latest_message_id = get_latest_poll_message_id_for_channel(channel.id)
-    if latest_message_id == poll_row["message_id"]:
-        return
+    if not force:
+        latest_message_id = get_latest_poll_message_id_for_channel(channel.id)
+        if latest_message_id == poll_row["message_id"]:
+            return False
 
     try:
         msg = await channel.fetch_message(poll_row["message_id"])
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return
+    except discord.NotFound:
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
 
     try:
         await msg.delete()
+        return True
     except discord.Forbidden:
-        pass
+        return False
     except discord.HTTPException:
-        pass
+        return False
 
 
 async def create_availability_poll(
@@ -2261,8 +2290,23 @@ async def process_poll_reminders():
 
         if diff <= timedelta(minutes=0):
             await notify_nonvoters(guild, poll_row)
-            await cleanup_expired_poll_message(guild, poll_row)
             close_poll(poll_row["id"])
+
+    for poll_row in get_polls_pending_cleanup():
+        try:
+            start_at = datetime.fromisoformat(poll_row["start_at"])
+            if start_at.tzinfo is None:
+                start_at = start_at.replace(tzinfo=BOT_TZ)
+        except ValueError:
+            continue
+
+        if now >= start_at + timedelta(hours=8):
+            if not poll_row["closed"]:
+                close_poll(poll_row["id"])
+
+            deleted = await cleanup_expired_poll_message(guild, poll_row, force=True)
+            if deleted:
+                mark_poll_cleanup_deleted(poll_row["id"])
 
 
 async def background_loop():
